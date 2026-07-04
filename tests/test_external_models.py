@@ -71,8 +71,9 @@ class TestRegistry:
 
         assert reg2.remove(m.model_id) is True
         assert reg2.list() == []
-        # endpoint key removed with the last model using it
-        assert reg2.get_api_key("https://openrouter.ai/api/v1") is None
+        # endpoint key survives removal so delete-and-re-add (a normal
+        # metadata-refresh flow) doesn't force re-entering the key
+        assert reg2.get_api_key("https://openrouter.ai/api/v1") == "sk-test"
 
     def test_duplicate_add_rejected(self, tmp_path):
         reg = ExternalModelRegistry(tmp_path)

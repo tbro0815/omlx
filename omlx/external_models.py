@@ -313,11 +313,9 @@ class ExternalModelRegistry:
         if model is None:
             return False
         self._save()
-        # Drop the endpoint key only when no other model uses that endpoint.
-        if not any(
-            self._key_ref(m.base_url) == self._key_ref(model.base_url)
-            for m in self._models.values()
-        ):
-            self.delete_api_key(model.base_url)
+        # Endpoint keys deliberately survive model removal: deleting and
+        # re-adding a model (e.g. to refresh catalog metadata) is a normal
+        # flow and should not force re-entering the key. Keys live only in
+        # the 0600 local file and are replaced by entering a new one.
         logger.info(f"Removed external model {model_id}")
         return True
