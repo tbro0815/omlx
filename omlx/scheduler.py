@@ -8074,7 +8074,12 @@ class Scheduler:
                     # singleton, so the dashboard entry leaks across model
                     # reload (#1405). Mirrors the cleanup in
                     # _advance_chunked_prefills (d736bfd).
-                    logger.error("Prefill failed for %s: %s", request.request_id, e)
+                    logger.error(
+                        "Prefill failed for %s: %s",
+                        request.request_id,
+                        e,
+                        exc_info=True,
+                    )
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)

@@ -89,6 +89,55 @@ def _load_jang_config(model_path: Path) -> dict | None:
     return None
 
 
+def _materialize_module_arrays(model) -> None:
+    """Force-evaluate ALL mx.arrays reachable from a model's modules.
+
+    ``mx.eval(model.parameters())`` (which jang_tools runs after loading)
+    skips underscore-prefixed attributes — e.g. rope frequency tables like
+    mistral4's ``_freqs`` created by mlx-lm's ``initialize_rope`` — leaving
+    them lazy and bound to the stream of the thread that built the model.
+    MLX streams are registered per thread, so the first evaluation from the
+    per-engine inference thread aborts prefill with "There is no
+    Stream(gpu, N) in current thread". Evaluating here, on the same thread
+    that created them, turns them into concrete buffers usable from any
+    thread.
+    """
+    arrays: list[mx.array] = []
+    seen: set[int] = set()
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, mx.array):
+            if id(value) not in seen:
+                seen.add(id(value))
+                arrays.append(value)
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                _collect(v)
+        elif isinstance(value, dict):
+            for v in value.values():
+                _collect(v)
+
+    modules = [model]
+    if hasattr(model, "named_modules"):
+        try:
+            modules = [m for _, m in model.named_modules()]
+        except Exception:
+            modules = [model]
+    for m in modules:
+        # mlx nn.Module is dict-backed: underscore attributes (excluded from
+        # parameters()) live in the module dict and/or instance __dict__.
+        try:
+            for v in vars(m).values():
+                _collect(v)
+        except TypeError:
+            pass
+        if isinstance(m, dict):
+            for v in m.values():
+                _collect(v)
+    if arrays:
+        mx.eval(arrays)
+
+
 class JANGLoader(BaseEngine):
     """
     Engine for loading JANG quantized models via jang-tools.
@@ -214,9 +263,34 @@ class JANGLoader(BaseEngine):
             return False
 
     def _needs_bfloat16(self) -> bool:
-        """Check if model needs bfloat16 (512+ experts, hidden>=4096)."""
+        """Check if the model must run in bfloat16 instead of float16.
+
+        Two triggers:
+        * 512+ experts with hidden>=4096 (historical heuristic), OR
+        * the JANG config records the source model was trained in bfloat16.
+
+        The second trigger is load-bearing: a bf16-trained model's
+        activations are not bounded by float16's 65504 max. E.g.
+        Mistral-Small-4-119B-JANG (128 experts — below the old threshold)
+        reaches hidden-state absmax ~1.8e5 by layer 32 in float16, which
+        overflows to inf, cascades to NaN logits, and makes every sampled
+        token id 0 (<unk>): endless, invisible generation.
+        """
         if self._model is None:
             return False
+        try:
+            jang_cfg = _load_jang_config(Path(self._model_name)) or {}
+            source_dtype = str(
+                (jang_cfg.get("source_model") or {}).get("dtype", "")
+            ).lower()
+            if source_dtype == "bfloat16":
+                logger.info(
+                    "JANG source model dtype is bfloat16; running in "
+                    "bfloat16 to avoid float16 activation overflow"
+                )
+                return True
+        except Exception as e:
+            logger.debug(f"Error checking jang_config source dtype: {e}")
         try:
             config = self._get_config_dict()
             text_cfg = config.get('text_config', config)
@@ -402,6 +476,17 @@ class JANGLoader(BaseEngine):
 
         config_bits = model_cfg.get("quantization", {}).get("bits", 8)
 
+        # Switch layers are the routed/shared MoE experts, so their width is
+        # moe_intermediate_size when present — NOT the dense MLP
+        # intermediate_size. E.g. Mistral-Small-4: hidden=4096, dense
+        # intermediate=12288, expert moe_intermediate=2048. The old
+        # out_dim==hidden -> in_dim=intermediate_size mapping mis-read healthy
+        # 4-bit down_proj experts (packed_dim=256 -> in_dim=2048) as corrupt.
+        moe_intermediate = tc.get("moe_intermediate_size", 0) or intermediate_size
+        shared_intermediate = (
+            tc.get("shared_expert_intermediate_size", 0) or moe_intermediate
+        )
+
         fixed = 0
         for name, module in self._model.named_modules():
             if not isinstance(module, QuantizedSwitchLinear):
@@ -415,39 +500,68 @@ class JANGLoader(BaseEngine):
             module_bits = getattr(module, "bits", config_bits)
             module_gs = getattr(module, "group_size", 64)
 
-            # Determine expected input_dims from architecture
-            if out_dim == intermediate_size:
-                in_dim = hidden_size      # gate_proj, up_proj
+            # Determine expected input_dims from the module's role (leaf
+            # name), with an out_dim-based fallback for unknown names. For
+            # projections INTO the expert space (gate/up) in_dim is always
+            # hidden_size; for projections OUT of it (down) in_dim is the
+            # expert width — try moe/shared/dense widths in that order.
+            leaf = name.rsplit(".", 1)[-1]
+            if leaf in ("down_proj", "w2"):
+                in_dim_candidates = [
+                    moe_intermediate, shared_intermediate, intermediate_size
+                ]
+            elif leaf in ("gate_proj", "up_proj", "gate_up_proj", "w1", "w3"):
+                in_dim_candidates = [hidden_size]
+            elif out_dim in (
+                intermediate_size,
+                moe_intermediate,
+                shared_intermediate,
+                2 * moe_intermediate,  # fused gate_up
+            ):
+                in_dim_candidates = [hidden_size]
             elif out_dim == hidden_size:
-                in_dim = intermediate_size # down_proj
+                in_dim_candidates = [
+                    moe_intermediate, shared_intermediate, intermediate_size
+                ]
             else:
                 logger.error(
                     f"JANG switch layer {name}: out_dim={out_dim} matches neither "
-                    f"intermediate_size={intermediate_size} nor hidden_size={hidden_size}; "
-                    f"cannot determine in_dim — corrupt or unexpected shard"
+                    f"an expert width (moe_intermediate_size={moe_intermediate}, "
+                    f"shared={shared_intermediate}, dense={intermediate_size}) "
+                    f"nor hidden_size={hidden_size}; cannot determine in_dim — "
+                    f"corrupt or unexpected shard"
                 )
                 raise ValueError(
                     f"JANG switch layer {name}: out_dim={out_dim} is unclassifiable "
-                    f"(intermediate_size={intermediate_size}, hidden_size={hidden_size})"
+                    f"(intermediate_size={intermediate_size}, "
+                    f"moe_intermediate_size={moe_intermediate}, "
+                    f"hidden_size={hidden_size})"
                 )
 
-            # Reverse-engineer actual bits by trying each plausible bit-width.
-            # For power-of-2 widths (2/4/8) the mapping is exact; for 3/6-bit
-            # MLX pads the packed dim, so we accept recovered_in_dim in the
-            # range [in_dim, in_dim + elem_per_u32).  If no width matches the
-            # layer is genuinely corrupt.
+            # Reverse-engineer actual bits by trying each plausible bit-width
+            # against each candidate in_dim. For power-of-2 widths (2/4/8) the
+            # mapping is exact; for 3/6-bit MLX pads the packed dim, so we
+            # accept recovered_in_dim in the range
+            # [in_dim, in_dim + elem_per_u32).  If no width matches any
+            # candidate the layer is genuinely corrupt.
             actual_bits = None
-            for candidate_bits in (2, 3, 4, 6, 8):
-                elem_per_u32 = 32 // candidate_bits
-                recovered = packed_dim * elem_per_u32
-                if in_dim <= recovered < in_dim + elem_per_u32:
-                    actual_bits = candidate_bits
+            in_dim = None
+            for cand in dict.fromkeys(d for d in in_dim_candidates if d):
+                for candidate_bits in (2, 3, 4, 6, 8):
+                    elem_per_u32 = 32 // candidate_bits
+                    recovered = packed_dim * elem_per_u32
+                    if cand <= recovered < cand + elem_per_u32:
+                        actual_bits = candidate_bits
+                        in_dim = cand
+                        break
+                if actual_bits is not None:
                     break
             if actual_bits is None:
                 raise ValueError(
                     f"JANG switch layer {name}: packed_dim={packed_dim} is not "
-                    f"consistent with in_dim={in_dim} for any supported bit-width "
-                    f"(2/3/4/6/8) — corrupt or mismatched shard"
+                    f"consistent with expected in_dim(s) "
+                    f"{sorted(set(d for d in in_dim_candidates if d))} for any "
+                    f"supported bit-width (2/3/4/6/8) — corrupt or mismatched shard"
                 )
 
             if actual_bits == module_bits:
@@ -538,6 +652,24 @@ class JANGLoader(BaseEngine):
             )
 
         try:
+            # Run the jang_tools loaders on the global MLX executor thread —
+            # the SAME thread that later runs prefill/decode. Loading on the
+            # event-loop thread binds lazily-created arrays to the main
+            # thread's default stream (gpu, 0): jang_tools does
+            # mx.eval(model.parameters()), but NON-parameter attributes (e.g.
+            # rope frequency tables stored as underscore attributes by
+            # mlx-lm/mlx-vlm, like mistral4's) stay lazy. The executor thread
+            # replaces its default stream with a thread-local one
+            # (engine_core._init_mlx_thread), so the first evaluation there
+            # aborts prefill with "There is no Stream(gpu, 0) in current
+            # thread". Executor-thread loading also keeps the event loop
+            # responsive during multi-GB loads.
+            import asyncio as _asyncio
+
+            from ..engine_core import get_mlx_executor
+
+            _loop = _asyncio.get_running_loop()
+
             # Dispatch to the correct loader.  JANGTQ models use TurboQuantLinear
             # (Metal kernel, no dequant) and load_jangtq_model auto-caps the MLX
             # wired_limit to prevent Metal OOM — must be checked before the
@@ -545,11 +677,15 @@ class JANGLoader(BaseEngine):
             if is_jangtq:
                 from jang_tools.load_jangtq import load_jangtq_model
                 logger.info(f"Loading JANGTQ model: {self._model_name}")
-                self._model, self._tokenizer = load_jangtq_model(self._model_name)
+                self._model, self._tokenizer = await _loop.run_in_executor(
+                    get_mlx_executor(), load_jangtq_model, self._model_name
+                )
                 self._processor = None
             elif is_vlm:
                 logger.info(f"Loading JANG VLM model: {self._model_name}")
-                self._model, self._processor = load_jang_vlm_model(self._model_name)
+                self._model, self._processor = await _loop.run_in_executor(
+                    get_mlx_executor(), load_jang_vlm_model, self._model_name
+                )
                 # Extract tokenizer from processor for token counting
                 if hasattr(self._processor, "tokenizer"):
                     self._tokenizer = self._processor.tokenizer
@@ -560,8 +696,26 @@ class JANGLoader(BaseEngine):
                 self._model = VLMModelAdapter(self._model)
             else:
                 logger.info(f"Loading JANG model: {self._model_name}")
-                self._model, self._tokenizer = load_jang_model(self._model_name)
+                self._model, self._tokenizer = await _loop.run_in_executor(
+                    get_mlx_executor(), load_jang_model, self._model_name
+                )
                 self._processor = None
+                # jang_tools may internally dispatch to its VLM loader: JANG
+                # v2 checkpoints with a vision_config (e.g. Mistral-Small-4)
+                # load as mlx-vlm models even when jang_config metadata says
+                # has_vision=false, so this text-only branch was chosen. Such
+                # models use the mlx-vlm calling convention (positional
+                # pixel_values/mask), which the text-only BatchGenerator
+                # cannot drive — every generation dies with
+                # "Model.__call__() missing 2 required positional arguments".
+                # Wrap with VLMModelAdapter (same as the VLM branch), which
+                # forwards text-only calls to the underlying language_model.
+                if hasattr(self._model, "language_model"):
+                    logger.info(
+                        "JANG loader returned a VLM-style model; wrapping "
+                        "with VLMModelAdapter for text-only serving"
+                    )
+                    self._model = VLMModelAdapter(self._model)
 
             # Wrap tokenizer if needed (some VLM processors don't have encode method)
             if self._tokenizer is not None and not hasattr(self._tokenizer, "encode"):
@@ -590,14 +744,34 @@ class JANGLoader(BaseEngine):
                 self._fix_jang_switch_quantization()
 
             # jang-tools already handles Nemotron-H repair in the v2 path.
+            # Runs on the MLX executor for the same stream-affinity reason as
+            # the loaders above (weight fixups create new arrays).
             if self._detect_nemotron_h() and not self._is_jang_v2():
                 logger.info("Detected Nemotron-H architecture, applying weight fixups")
-                self._fix_nemotron_h_weights()
+                await _loop.run_in_executor(
+                    get_mlx_executor(), self._fix_nemotron_h_weights
+                )
 
-            # Auto-switch to bfloat16 for large expert models
+            # Auto-switch to bfloat16 (bf16-trained source model or large
+            # expert count — see _needs_bfloat16). set_dtype creates lazy
+            # astype arrays — run on the MLX executor so they bind to the
+            # inference thread's stream.
             if self._needs_bfloat16():
-                logger.info("Large expert model detected (512+ experts, hidden>=4096), using bfloat16")
-                self._model.set_dtype(mx.bfloat16)
+                logger.info("Running model in bfloat16 (see _needs_bfloat16)")
+                await _loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: self._model.set_dtype(mx.bfloat16),
+                )
+
+            # Materialize every array reachable from the model — including
+            # non-parameter attributes — on the loader thread, so no lazy
+            # array bound to this thread's stream survives into inference on
+            # the per-engine thread (see _materialize_module_arrays).
+            await _loop.run_in_executor(
+                get_mlx_executor(),
+                _materialize_module_arrays,
+                self._model,
+            )
 
             # Create engine config (copy to avoid mutating the shared instance)
             scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
@@ -620,8 +794,33 @@ class JANGLoader(BaseEngine):
             logger.info(f"JANGLoader loaded: {self._model_name}")
 
         except Exception as e:
+            import gc
+            import traceback as _traceback
+
             from ..exceptions import JANGLoadError
-            # Best-effort cleanup to avoid leaking Metal buffers on failed load.
+
+            # Log the full traceback NOW, because we strip __traceback__ from
+            # the exception chain below. The jang_tools loader frames in that
+            # traceback hold locals referencing the fully loaded model (tens
+            # of GB of Metal buffers — e.g. a JANG v2 VLM whose weights load
+            # fine before the processor step raises). As long as any
+            # traceback in the chain is alive, gc + mx.clear_cache() cannot
+            # reclaim those buffers and the process footprint stays inflated,
+            # blocking subsequent loads at the memory-ceiling admission check.
+            logger.error(
+                "JANG load failed for %s:\n%s",
+                self._model_name,
+                "".join(_traceback.format_exception(type(e), e, e.__traceback__)),
+            )
+            _seen: set[int] = set()
+            _exc: BaseException | None = e
+            while _exc is not None and id(_exc) not in _seen:
+                _seen.add(id(_exc))
+                _exc.__traceback__ = None
+                _exc = _exc.__cause__ or _exc.__context__
+
+            # Best-effort cleanup AFTER dropping the tracebacks, so the model
+            # weights referenced by those frames are actually collectable.
             # Wrapped in its own try/except so cleanup failure doesn't mask the
             # original load error.
             try:
@@ -629,6 +828,8 @@ class JANGLoader(BaseEngine):
             except Exception as cleanup_exc:
                 logger.debug(f"Cleanup after failed JANG load raised: {cleanup_exc}")
             try:
+                gc.collect()
+                mx.synchronize()
                 mx.clear_cache()
             except Exception as cache_exc:
                 logger.debug(f"mx.clear_cache() after failed JANG load raised: {cache_exc}")
