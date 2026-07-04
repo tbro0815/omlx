@@ -307,8 +307,19 @@ class CLIRelayEngine(BaseEngine):
         return cmd
 
     async def _spawn(self, cmd: list[str]) -> asyncio.subprocess.Process:
+        # Log the invocation shape (flags only — argv[-1]/-p payloads are
+        # prompt content) so hangs are diagnosable from the server log.
+        logger.debug(
+            "cli_relay spawn: %s",
+            " ".join(c if len(c) < 40 else f"<{len(c)} chars>" for c in cmd),
+        )
+        # stdin MUST be detached: the CLIs probe stdin for piped input and
+        # can block forever on an inherited descriptor that never EOFs
+        # (observed as a bench stuck in 'starting' under the service
+        # environment).
         return await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._scratch_dir,
