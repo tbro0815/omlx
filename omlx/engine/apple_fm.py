@@ -373,6 +373,16 @@ class AppleFMEngine(BaseEngine):
         """Return (finish_reason, message) for SDK exceptions."""
         fm = self._fm
         name = type(e).__name__
+        if name in ("ImagePromptError", "PromptError") and "macOS 27" in str(e):
+            return "error", (
+                "On-device vision is unavailable: the installed apple-fm-sdk "
+                "was compiled without the macOS 27 SDK (image attachments "
+                "need it). Text generation is unaffected. To enable vision: "
+                "install an Xcode version that ships the macOS 27 SDK, then "
+                "reinstall the SDK from source: \"$(brew --prefix omlx)"
+                "/libexec/bin/pip\" install --force-reinstall --no-binary "
+                ":all: apple-fm-sdk"
+            )
         if fm is not None:
             if isinstance(e, getattr(fm, "GuardrailViolationError", ())) or (
                 isinstance(e, getattr(fm, "RefusalError", ()))
@@ -554,6 +564,23 @@ class AppleFMEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         instructions, prompt, image_refs = self._flatten_messages(messages)
+        if image_refs:
+            # The SDK's streaming bridge hangs (instead of raising) when
+            # attachment composition fails; respond() fails cleanly and
+            # vision answers are short, so serve image requests
+            # non-streaming and emit a single final chunk.
+            out = await self._respond_once(
+                instructions, prompt, max_tokens, temperature, image_refs
+            )
+            yield GenerationOutput(
+                text=out.text,
+                new_text=out.text,
+                finished=True,
+                finish_reason=out.finish_reason,
+                prompt_tokens=out.prompt_tokens,
+                completion_tokens=out.completion_tokens,
+            )
+            return
         async for out in self._stream_once(
             instructions, prompt, max_tokens, temperature, image_refs
         ):
