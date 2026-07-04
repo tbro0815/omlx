@@ -4247,7 +4247,7 @@
                     this.extError = 'Pick a model from the list or enter a model ID';
                     return;
                 }
-                if (this.extProvider !== 'openrouter' && !this.extBaseUrl.trim()) {
+                if (this.extProvider === 'openai_compatible' && !this.extBaseUrl.trim()) {
                     this.extError = 'Base URL is required for a generic endpoint';
                     return;
                 }
