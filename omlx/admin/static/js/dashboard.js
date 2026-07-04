@@ -323,6 +323,7 @@
             extDisplayName: '',
             extError: '',
             extAdding: false,
+            extUse1m: true,
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
@@ -4192,6 +4193,7 @@
                 this.extCatalogFilter = '';
                 this.extRemoteModel = '';
                 this.extDisplayName = '';
+                this.extUse1m = true;
             },
 
             extEffectiveBaseUrl() {
@@ -4204,6 +4206,14 @@
                     return this.extBaseUrl || presets[this.extProvider];
                 }
                 return this.extBaseUrl;
+            },
+
+            ext1mCapable() {
+                const id = (this.extRemoteModel || '').toLowerCase();
+                const meta = this.extCatalog.find(m => m.id === this.extRemoteModel);
+                if (meta && 'supports_1m' in meta) return !!meta.supports_1m;
+                // manual entry fallback: match known 1M-GA families
+                return /(sonnet-4-6|opus-4-[678]|sonnet-5|opus-5|fable-5)/.test(id);
             },
 
             extFilteredCatalog() {
@@ -4259,6 +4269,10 @@
                 this.extAdding = true;
                 try {
                     const meta = this.extCatalog.find(m => m.id === remoteModel);
+                    let contextLength = meta?.context_length ?? null;
+                    if (this.extProvider === 'anthropic' && this.ext1mCapable()) {
+                        contextLength = this.extUse1m ? 1000000 : 200000;
+                    }
                     const response = await fetch('/admin/api/external-models', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -4268,7 +4282,7 @@
                             remote_model: remoteModel,
                             display_name: this.extDisplayName.trim(),
                             api_key: this.extApiKey || undefined,
-                            context_length: meta?.context_length ?? null,
+                            context_length: contextLength,
                             max_output_tokens: meta?.max_output_tokens ?? null,
                             modality: meta?.modality ?? null,
                         }),

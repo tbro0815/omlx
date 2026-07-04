@@ -6618,10 +6618,35 @@ async def external_model_catalog(
         top = item.get("top_provider")
         if isinstance(top, dict):
             max_out = top.get("max_completion_tokens")
+        supports_1m = False
         if provider == "anthropic":
             # Uniform across current Claude models; all are multimodal.
+            # 1M context is GA (standard pricing, no beta header) on the
+            # 4.6+ generation; default entries to 200k and let the UI's
+            # 1M checkbox raise it.
+            _1M_FAMILIES = (
+                "sonnet-4-6", "opus-4-6", "opus-4-7", "opus-4-8",
+                "sonnet-5", "opus-5", "fable-5",
+            )
+            supports_1m = any(f in mid for f in _1M_FAMILIES)
             ctx = ctx or 200_000
-            max_out = max_out or 64_000
+            # Output caps vary by family: 32k (Sonnet 4.6), 64k
+            # (Opus 4.6), 128k (5-generation models).
+            if max_out is None:
+                for fam, cap in (
+                    ("sonnet-4-6", 32_000),
+                    ("opus-4-6", 64_000),
+                    ("opus-4-7", 128_000),
+                    ("opus-4-8", 128_000),
+                    ("sonnet-5", 128_000),
+                    ("opus-5", 128_000),
+                    ("fable-5", 128_000),
+                ):
+                    if fam in mid:
+                        max_out = cap
+                        break
+                else:
+                    max_out = 64_000
             modality = modality or "text+image"
         elif provider == "openai":
             if mid.startswith(_OPENAI_NON_CHAT_PREFIXES):
@@ -6639,6 +6664,7 @@ async def external_model_catalog(
                 "context_length": ctx,
                 "max_output_tokens": max_out,
                 "modality": modality,
+                "supports_1m": supports_1m,
             }
         )
     models.sort(key=lambda m: m["id"])
