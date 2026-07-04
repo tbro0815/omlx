@@ -7,6 +7,32 @@
 </p>
 
 <h1 align="center">oMLX</h1>
+<p align="center"><b>omlx-jq fork</b> — oMLX with JANG model support and torch-free VLM fixes</p>
+
+> ### About this fork
+>
+> This is a personal fork of [oMLX](https://github.com/jundot/omlx) (based on the
+> v0.4.4 release line) that adds and hardens **JANG quantized model support**
+> (jang-tools / JANGTQ integration) plus several fixes developed while bringing
+> `Mistral-Small-4-119B-JANG` up on a torch-free install:
+>
+> - **Failed-load memory reclaim** — a failed model load no longer leaks the
+>   partially loaded weights (they were pinned by the exception's traceback
+>   frames; ~67 GB per failed 119B load) — [proposed upstream](https://github.com/jundot/omlx/pulls).
+> - **Torch-free Pixtral/mistral3 processor** — real `PixtralProcessor` without
+>   torch+torchvision (transformers 5.x gates it), incl. PIL image-processor
+>   backend and `MistralCommonBackend` → `TokenizersBackend` swap — proposed upstream.
+> - **JANG routing by declared format** — metadata-only `jang_config.json`
+>   models load through the standard engines.
+> - **JANG engine correctness** — MLX stream-affinity fixes (loaders and dtype
+>   conversions run on the inference executor; all module arrays materialized at
+>   load), `VLMModelAdapter` wrap for VLM-style models on the text path,
+>   MoE-aware switch-layer quantization checks, and automatic **bfloat16** for
+>   bf16-trained JANG sources (float16 activation overflow otherwise produces
+>   NaN logits / endless `<unk>` output).
+>
+> Upstream README continues below.
+
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">
