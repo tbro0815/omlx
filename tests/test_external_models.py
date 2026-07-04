@@ -291,6 +291,9 @@ class TestAppleFMRegistry:
         assert m.model_id == "ext.afm.on-device"
         assert m.base_url == "applefm://local"
         assert reg.get_api_key(m.base_url) is None
+        # multimodal by default -> pool injects it as a vlm entry and the
+        # chat UI enables image upload
+        assert m.modality == "text+image"
 
 
 class TestAppleFMEngine:

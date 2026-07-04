@@ -224,6 +224,9 @@ class ExternalModelRegistry:
             # In-process SDK: no endpoint, no key, nothing to validate.
             base_url = "applefm://local"
             api_key = None
+            # AFM 3 is multimodal (image input); default the modality so
+            # the chat UI enables image upload (model_type becomes "vlm").
+            modality = modality or "text+image"
         else:
             base_url = base_url.rstrip("/")
             validate_not_self_endpoint(base_url, server_port)
