@@ -416,6 +416,7 @@ class EnginePool:
             remote_model=record.remote_model,
             api_key=registry.get_api_key(record.base_url),
             provider=record.provider,
+            max_output_tokens=getattr(record, "max_output_tokens", None),
         )
 
     def discover_models(

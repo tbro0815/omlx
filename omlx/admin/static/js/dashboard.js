@@ -4269,6 +4269,7 @@
                             display_name: this.extDisplayName.trim(),
                             api_key: this.extApiKey || undefined,
                             context_length: meta?.context_length ?? null,
+                            max_output_tokens: meta?.max_output_tokens ?? null,
                             modality: meta?.modality ?? null,
                         }),
                     });

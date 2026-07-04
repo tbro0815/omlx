@@ -143,6 +143,7 @@ class RemoteOpenAIEngine(BaseEngine):
         provider: str = "openai_compatible",
         timeout: float = 300.0,
         extra_headers: dict[str, str] | None = None,
+        max_output_tokens: int | None = None,
     ):
         self._model_name = model_name
         self._base_url = base_url.rstrip("/")
@@ -150,6 +151,7 @@ class RemoteOpenAIEngine(BaseEngine):
         self._api_key = api_key
         self._provider = provider
         self._timeout = timeout
+        self._max_output_tokens = max_output_tokens
         self._extra_headers = dict(extra_headers or {})
         self._client: httpx.AsyncClient | None = None
         self._tokenizer = _ApproxTokenizer()
@@ -283,6 +285,10 @@ class RemoteOpenAIEngine(BaseEngine):
         presence_penalty: float,
         **kwargs,
     ) -> dict[str, Any]:
+        # Clamp to the provider's documented output cap so oversized local
+        # defaults (e.g. a global 32k max-tokens setting) don't 400.
+        if self._max_output_tokens and max_tokens > self._max_output_tokens:
+            max_tokens = self._max_output_tokens
         payload: dict[str, Any] = {
             "model": self._remote_model,
             "max_tokens": max_tokens,

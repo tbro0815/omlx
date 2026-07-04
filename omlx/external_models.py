@@ -59,6 +59,21 @@ PRESET_BASE_URLS = {
 # oMLX never sees or stores OAuth tokens — the CLIs manage their own auth.
 CLI_PROVIDERS = ("claude_cli", "codex_cli")
 
+# Best-effort provider defaults for metadata their /models endpoints don't
+# report. Current Claude models are uniform (200k context, 64k max output,
+# vision); OpenAI's chat models are all multimodal — context varies by
+# family and is filled by the catalog route instead.
+PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "anthropic": {
+        "context_length": 200_000,
+        "max_output_tokens": 64_000,
+        "modality": "text+image",
+    },
+    "openai": {
+        "modality": "text+image",
+    },
+}
+
 _ID_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -77,6 +92,7 @@ class ExternalModel:
     display_name: str = ""
     # Optional metadata from the provider catalog (context length etc.).
     context_length: int | None = None
+    max_output_tokens: int | None = None  # provider cap on generated tokens
     modality: str | None = None  # e.g. "text", "text+image"
     created_at: float = field(default_factory=time.time)
 
@@ -241,6 +257,7 @@ class ExternalModelRegistry:
         api_key: str | None = None,
         server_port: int | None = None,
         context_length: int | None = None,
+        max_output_tokens: int | None = None,
         modality: str | None = None,
     ) -> ExternalModel:
         if provider not in PROVIDERS:
@@ -264,6 +281,11 @@ class ExternalModelRegistry:
         if not remote_model or not remote_model.strip():
             raise ValueError("remote_model must not be empty")
 
+        defaults = PROVIDER_DEFAULTS.get(provider, {})
+        context_length = context_length or defaults.get("context_length")
+        max_output_tokens = max_output_tokens or defaults.get("max_output_tokens")
+        modality = modality or defaults.get("modality")
+
         model = ExternalModel(
             model_id=make_model_id(provider, remote_model),
             provider=provider,
@@ -271,6 +293,7 @@ class ExternalModelRegistry:
             remote_model=remote_model.strip(),
             display_name=display_name or remote_model,
             context_length=context_length,
+            max_output_tokens=max_output_tokens,
             modality=modality,
         )
         if model.model_id in self._models:

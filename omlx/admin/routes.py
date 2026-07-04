@@ -6408,6 +6408,17 @@ async def add_external_model(
         base_url = OPENROUTER_BASE_URL
     remote_model = (body.get("remote_model") or "").strip()
 
+    context_length = body.get("context_length")
+    if provider == "apple_fm" and not context_length:
+        # Query the SDK for the real on-device context window instead of
+        # letting the entry fall back to the global default.
+        try:
+            import apple_fm_sdk as fm
+
+            context_length = int(fm.SystemLanguageModel().context_size) or None
+        except Exception:  # noqa: BLE001 — SDK missing or too old
+            context_length = None
+
     try:
         model = registry.add(
             provider=provider,
@@ -6416,7 +6427,8 @@ async def add_external_model(
             display_name=(body.get("display_name") or "").strip(),
             api_key=(body.get("api_key") or "").strip() or None,
             server_port=_server_port(),
-            context_length=body.get("context_length"),
+            context_length=context_length,
+            max_output_tokens=body.get("max_output_tokens"),
             modality=body.get("modality"),
         )
     except SelfEndpointError as e:
@@ -6495,12 +6507,16 @@ async def external_model_catalog(
                     f"{getattr(reason, 'name', reason)}"
                 ),
             )
+        try:
+            afm_ctx = int(model.context_size) or None
+        except Exception:  # noqa: BLE001 — older SDK builds lack the property
+            afm_ctx = None
         return {
             "models": [
                 {
                     "id": "on-device",
                     "name": "Apple Intelligence (on-device AFM)",
-                    "context_length": None,
+                    "context_length": afm_ctx,
                     "modality": "text+image",
                 }
             ],
@@ -6572,20 +6588,56 @@ async def external_model_catalog(
     except Exception:
         raise HTTPException(status_code=502, detail="Catalog response not JSON")
 
+    # OpenAI's /models mixes chat models with embeddings/audio/image
+    # endpoints that can't serve chat completions; hide the obvious ones.
+    _OPENAI_NON_CHAT_PREFIXES = (
+        "text-embedding", "whisper", "tts", "dall-e", "omni-moderation",
+        "babbage", "davinci", "text-moderation", "gpt-image", "sora",
+    )
+    # Best-effort context/output caps for families whose catalogs don't
+    # report them (Anthropic/OpenAI omit both from /models).
+    _OPENAI_FAMILY_LIMITS = (
+        ("gpt-5", (400_000, 128_000)),
+        ("o3", (200_000, 100_000)),
+        ("o4", (200_000, 100_000)),
+        ("gpt-4.1", (1_000_000, 32_768)),
+        ("gpt-4o", (128_000, 16_384)),
+    )
+
     models = []
     for item in data:
         if not isinstance(item, dict) or not item.get("id"):
             continue
+        mid = item["id"]
         modality = None
         ctx = item.get("context_length")
+        max_out = None
         arch = item.get("architecture")
         if isinstance(arch, dict):
             modality = arch.get("modality")
+        top = item.get("top_provider")
+        if isinstance(top, dict):
+            max_out = top.get("max_completion_tokens")
+        if provider == "anthropic":
+            # Uniform across current Claude models; all are multimodal.
+            ctx = ctx or 200_000
+            max_out = max_out or 64_000
+            modality = modality or "text+image"
+        elif provider == "openai":
+            if mid.startswith(_OPENAI_NON_CHAT_PREFIXES):
+                continue
+            for fam, (fam_ctx, fam_out) in _OPENAI_FAMILY_LIMITS:
+                if mid.startswith(fam):
+                    ctx = ctx or fam_ctx
+                    max_out = max_out or fam_out
+                    break
+            modality = modality or "text+image"
         models.append(
             {
-                "id": item["id"],
-                "name": item.get("name") or item.get("display_name") or item["id"],
+                "id": mid,
+                "name": item.get("name") or item.get("display_name") or mid,
                 "context_length": ctx,
+                "max_output_tokens": max_out,
                 "modality": modality,
             }
         )

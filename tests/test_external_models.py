@@ -959,3 +959,71 @@ class TestAnthropicSamplingQuirks:
         assert "top_p" in bodies[0] and "top_p" not in bodies[1]
         assert bodies[1]["temperature"] == 0.7
         await engine.stop()
+
+
+class TestExternalModelMetadata:
+    def test_anthropic_defaults_fill_ctx_output_and_vision(self, tmp_path):
+        reg = ExternalModelRegistry(tmp_path)
+        m = reg.add(
+            provider="anthropic",
+            base_url="",
+            remote_model="claude-sonnet-4-6",
+            server_port=8000,
+        )
+        assert m.context_length == 200_000
+        assert m.max_output_tokens == 64_000
+        assert m.modality == "text+image"
+
+    def test_openai_defaults_to_vision_modality(self, tmp_path):
+        reg = ExternalModelRegistry(tmp_path)
+        m = reg.add(
+            provider="openai", base_url="", remote_model="gpt-5.4-mini",
+            server_port=8000,
+        )
+        assert m.modality == "text+image"
+
+    def test_catalog_metadata_wins_over_defaults(self, tmp_path):
+        reg = ExternalModelRegistry(tmp_path)
+        m = reg.add(
+            provider="anthropic",
+            base_url="",
+            remote_model="claude-sonnet-4-6",
+            server_port=8000,
+            context_length=1_000_000,
+            max_output_tokens=32_000,
+        )
+        assert m.context_length == 1_000_000
+        assert m.max_output_tokens == 32_000
+
+    async def test_engine_clamps_max_tokens_to_provider_cap(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}}
+            )
+
+        engine = RemoteOpenAIEngine(
+            model_name="ext.or.capped",
+            base_url="https://mock.example/v1",
+            remote_model="vendor/capped",
+            api_key="sk-test",
+            provider="openrouter",
+            max_output_tokens=1000,
+        )
+
+        async def _start():
+            engine._client = httpx.AsyncClient(
+                base_url="https://mock.example/v1",
+                transport=httpx.MockTransport(handler),
+            )
+            engine._loaded = True
+
+        engine.start = _start
+        await engine.start()
+        await engine.chat(
+            messages=[{"role": "user", "content": "hi"}], max_tokens=32_768
+        )
+        assert seen["max_tokens"] == 1000
+        await engine.stop()
