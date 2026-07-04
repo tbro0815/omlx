@@ -6347,3 +6347,178 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# External (remote API) models
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _get_external_registry():
+    state = _get_server_state()
+    registry = getattr(state, "external_registry", None)
+    if registry is None:
+        raise HTTPException(
+            status_code=503, detail="External model registry not initialized"
+        )
+    return registry
+
+
+def _server_port() -> int | None:
+    gs = _get_global_settings() if _get_global_settings else None
+    try:
+        return int(gs.server.port) if gs is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+@router.get("/api/external-models")
+async def list_external_models(is_admin: bool = Depends(require_admin)):
+    """List registered external models with load status."""
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+    out = []
+    for m in registry.list():
+        entry = engine_pool.get_entry(m.model_id) if engine_pool else None
+        rec = m.to_dict()
+        rec["loaded"] = bool(entry and entry.engine is not None)
+        rec["has_api_key"] = registry.get_api_key(m.base_url) is not None
+        out.append(rec)
+    return {"models": out}
+
+
+@router.post("/api/external-models")
+async def add_external_model(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    """Register an external model.
+
+    Body: {provider, base_url, remote_model, display_name?, api_key?,
+           context_length?, modality?}
+    """
+    from ..external_models import OPENROUTER_BASE_URL, SelfEndpointError
+
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+    body = await request.json()
+
+    provider = (body.get("provider") or "").strip()
+    base_url = (body.get("base_url") or "").strip()
+    if provider == "openrouter" and not base_url:
+        base_url = OPENROUTER_BASE_URL
+    remote_model = (body.get("remote_model") or "").strip()
+
+    try:
+        model = registry.add(
+            provider=provider,
+            base_url=base_url,
+            remote_model=remote_model,
+            display_name=(body.get("display_name") or "").strip(),
+            api_key=(body.get("api_key") or "").strip() or None,
+            server_port=_server_port(),
+            context_length=body.get("context_length"),
+            modality=body.get("modality"),
+        )
+    except SelfEndpointError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if engine_pool is not None:
+        engine_pool._inject_external_entries()
+    return {"success": True, "model": model.to_dict()}
+
+
+@router.delete("/api/external-models/{model_id}")
+async def delete_external_model(
+    model_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove an external model (unloads it first if loaded)."""
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+
+    if engine_pool is not None:
+        entry = engine_pool.get_entry(model_id)
+        if entry is not None and entry.engine is not None:
+            await engine_pool._unload_engine(model_id)
+
+    if not registry.remove(model_id):
+        raise HTTPException(status_code=404, detail="External model not found")
+    if engine_pool is not None:
+        engine_pool._inject_external_entries()
+    return {"success": True}
+
+
+@router.post("/api/external-models/catalog")
+async def external_model_catalog(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    """Fetch the provider's model catalog for the picker dropdown.
+
+    Body: {provider, base_url?, api_key?} — uses the stored endpoint key
+    when none is supplied. Returns a normalized list:
+    [{id, name, context_length, modality}].
+    """
+    import httpx as _httpx
+
+    from ..external_models import (
+        OPENROUTER_BASE_URL,
+        SelfEndpointError,
+        validate_not_self_endpoint,
+    )
+
+    registry = _get_external_registry()
+    body = await request.json()
+    provider = (body.get("provider") or "").strip()
+    base_url = (body.get("base_url") or "").strip()
+    if provider == "openrouter" and not base_url:
+        base_url = OPENROUTER_BASE_URL
+    base_url = base_url.rstrip("/")
+
+    try:
+        validate_not_self_endpoint(base_url, _server_port())
+    except SelfEndpointError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    api_key = (body.get("api_key") or "").strip() or registry.get_api_key(base_url)
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with _httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{base_url}/models", headers=headers)
+    except _httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Catalog fetch failed: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Catalog fetch failed: HTTP {resp.status_code}",
+        )
+
+    try:
+        data = resp.json().get("data", [])
+    except Exception:
+        raise HTTPException(status_code=502, detail="Catalog response not JSON")
+
+    models = []
+    for item in data:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        modality = None
+        ctx = item.get("context_length")
+        arch = item.get("architecture")
+        if isinstance(arch, dict):
+            modality = arch.get("modality")
+        models.append(
+            {
+                "id": item["id"],
+                "name": item.get("name") or item["id"],
+                "context_length": ctx,
+                "modality": modality,
+            }
+        )
+    models.sort(key=lambda m: m["id"])
+    return {"models": models, "base_url": base_url}

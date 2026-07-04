@@ -31,6 +31,12 @@
 >   bf16-trained JANG sources (float16 activation overflow otherwise produces
 >   NaN logits / endless `<unk>` output).
 >
+> - **External models (API)** — "Add External Model" in the Model Manager
+>   connects OpenRouter or any generic OpenAI-compatible endpoint; remote
+>   models appear alongside local ones in chat, benchmarks, and the
+>   OpenAI-compatible server (oMLX as local model broker). Self-referencing
+>   endpoints are blocked; keys stored locally with 0600 permissions.
+>
 > Upstream README continues below.
 
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>

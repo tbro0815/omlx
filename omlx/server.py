@@ -272,6 +272,7 @@ class ServerState:
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
+    external_registry: Optional[object] = None  # ExternalModelRegistry
     global_settings: Optional[object] = None  # GlobalSettings
     hf_downloader: Optional[object] = None  # HFDownloader
     ms_downloader: Optional[object] = None  # MSDownloader
@@ -1742,6 +1743,15 @@ def init_server(
     # is constructed.
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
+    )
+
+    # External (remote API) models: attach the registry BEFORE discovery so
+    # the post-scan injection hook can add their entries.
+    from .external_models import ExternalModelRegistry
+
+    _server_state.external_registry = ExternalModelRegistry(base_path)
+    _server_state.engine_pool.attach_external_registry(
+        _server_state.external_registry
     )
 
     # Discover models (use pinned models from settings file)

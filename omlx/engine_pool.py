@@ -67,6 +67,7 @@ class EngineEntry:
         "reranker",
         "vlm",
         "jang",
+        "remote",
         "audio_stt",
         "audio_tts",
         "audio_sts",
@@ -340,6 +341,68 @@ class EnginePool:
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
 
+    def attach_external_registry(self, registry) -> None:
+        """Attach an ExternalModelRegistry and inject its models as entries."""
+        self._external_registry = registry
+        self._inject_external_entries()
+
+    def _inject_external_entries(self) -> None:
+        """(Re-)create EngineEntry records for registered external models.
+
+        External models have no local directory: estimated_size is 0 (they
+        occupy no local memory, so the memory-ceiling admission ignores
+        them) and engine_type "remote" routes them to RemoteOpenAIEngine.
+        Loaded entries are left untouched.
+        """
+        registry = getattr(self, "_external_registry", None)
+        if registry is None:
+            return
+        registered_ids = set()
+        for m in registry.list():
+            registered_ids.add(m.model_id)
+            existing = self._entries.get(m.model_id)
+            if existing is not None:
+                continue  # keep loaded/idle entry as-is
+            self._entries[m.model_id] = EngineEntry(
+                model_id=m.model_id,
+                model_path=f"{m.base_url}#{m.remote_model}",
+                model_type=(
+                    "vlm" if (m.modality or "").find("image") >= 0 else "llm"
+                ),
+                engine_type="remote",
+                estimated_size=0,
+                model_context_length=m.context_length,
+                source_type="external",
+                source_repo_id=m.remote_model,
+            )
+            logger.info(f"Injected external model entry: {m.model_id}")
+        # Drop external entries whose registry record was removed (only when
+        # not loaded; a loaded one is dropped on its next unload + rescan).
+        for mid in [
+            mid
+            for mid, e in self._entries.items()
+            if e.source_type == "external"
+            and mid not in registered_ids
+            and e.engine is None
+        ]:
+            del self._entries[mid]
+
+    def _build_remote_engine(self, model_id: str):
+        """Construct a RemoteOpenAIEngine from the external registry record."""
+        from .engine.remote import RemoteOpenAIEngine
+
+        registry = getattr(self, "_external_registry", None)
+        record = registry.get(model_id) if registry is not None else None
+        if record is None:
+            raise ModelNotFoundError(model_id)
+        return RemoteOpenAIEngine(
+            model_name=model_id,
+            base_url=record.base_url,
+            remote_model=record.remote_model,
+            api_key=registry.get_api_key(record.base_url),
+            provider=record.provider,
+        )
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:
@@ -393,15 +456,22 @@ class EnginePool:
             if model_id in pinned_set:
                 logger.info(f"Pinned model: {model_id}")
 
-        # Remove entries no longer discovered and not loaded
+        # Remove entries no longer discovered and not loaded.
+        # External (remote API) entries have no backing directory and are
+        # managed by the ExternalModelRegistry, not the scanner — exempt.
         discovered_ids = set(discovered.keys())
         stale = [
             mid
             for mid in self._entries
-            if mid not in discovered_ids and self._entries[mid].engine is None
+            if mid not in discovered_ids
+            and self._entries[mid].engine is None
+            and self._entries[mid].source_type != "external"
         ]
         for mid in stale:
             del self._entries[mid]
+
+        # (Re-)inject external models after every rescan.
+        self._inject_external_entries()
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())
@@ -1408,7 +1478,9 @@ class EnginePool:
 
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
-                if effective_type == "embedding":
+                if effective_type == "remote":
+                    engine = self._build_remote_engine(model_id)
+                elif effective_type == "embedding":
                     engine = EmbeddingEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
