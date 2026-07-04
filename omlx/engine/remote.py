@@ -81,6 +81,34 @@ class _ApproxTokenizer:
                 out.append(" lorem")  # unknown id: harmless filler
         return "".join(out)
 
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        **_kwargs,
+    ):
+        """Naive template for local token *estimates* only.
+
+        The remote provider renders its real chat template server-side;
+        this exists so server-side stats/counting paths that reach for
+        tokenizer.apply_chat_template don't crash on remote engines.
+        """
+        parts = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(b.get("text") or "")
+                    for b in content
+                    if isinstance(b, dict)
+                )
+            parts.append(f"{m.get('role', 'user')}: {content or ''}")
+        text = "\n".join(parts)
+        if add_generation_prompt:
+            text += "\nassistant:"
+        return self.encode(text) if tokenize else text
+
 
 class RemoteOpenAIEngine(BaseEngine):
     """OpenAI-compatible HTTP engine (OpenRouter / generic endpoints)."""
@@ -134,6 +162,40 @@ class RemoteOpenAIEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         return self._active_requests > 0
+
+    def count_tokens(self, text: str) -> int:
+        """Approximate token count (~4 chars/token); real counts come from
+        the API usage block per request."""
+        return max(1, len(text or "") // 4)
+
+    def count_chat_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[dict]] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        """Approximate prompt token count for chat messages.
+
+        The provider applies its own chat template server-side, so an exact
+        local count is impossible. Estimate from message content lengths
+        plus per-message overhead; server paths use this only for stats and
+        context-limit pre-checks, and the streamed usage block supplies the
+        real numbers afterwards.
+        """
+        total = 0
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        total += len(str(block.get("text") or ""))
+            total += 16  # role + template overhead per message (chars)
+        if tools:
+            total += len(json.dumps(tools))
+        return max(1, total // 4)
 
     def get_stats(self) -> Dict[str, Any]:
         return {
