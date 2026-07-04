@@ -113,6 +113,11 @@ class _ApproxTokenizer:
 class RemoteOpenAIEngine(BaseEngine):
     """OpenAI-compatible HTTP engine (OpenRouter / generic endpoints)."""
 
+    # Preserve image_url content parts in the server's chat path; vision
+    # models behind OpenAI-compatible APIs consume them natively, and
+    # text-only requests are unaffected.
+    supports_multimodal_fallback = True
+
     def __init__(
         self,
         model_name: str,

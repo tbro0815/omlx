@@ -46,6 +46,11 @@ AFM_VARIANTS = {
 class AppleFMEngine(BaseEngine):
     """On-device Apple Foundation Models engine."""
 
+    # Tell the server's chat path to preserve image_url content parts
+    # (otherwise extract_text_content strips them and the model answers
+    # blind). Same mechanism DFlash uses for its VLM fallback.
+    supports_multimodal_fallback = True
+
     def __init__(
         self,
         model_name: str,
