@@ -229,6 +229,12 @@ class RemoteOpenAIEngine(BaseEngine):
             # OpenRouter attribution headers (optional but polite).
             headers.setdefault("HTTP-Referer", "https://github.com/jundot/omlx")
             headers.setdefault("X-Title", "oMLX")
+        elif self._provider == "anthropic" and self._api_key:
+            # Anthropic's OpenAI-compat layer accepts Authorization: Bearer,
+            # but supplying x-api-key too keeps native endpoints (e.g.
+            # /v1/models) reachable through the same client.
+            headers.setdefault("x-api-key", self._api_key)
+            headers.setdefault("anthropic-version", "2023-06-01")
         headers.update(self._extra_headers)
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
@@ -297,6 +303,22 @@ class RemoteOpenAIEngine(BaseEngine):
         )
         if enable_thinking is not None and self._provider == "openrouter":
             payload["reasoning"] = {"enabled": bool(enable_thinking)}
+        elif self._provider == "anthropic":
+            # Anthropic's compat layer ignores reasoning_effort but honors
+            # the native extended-thinking extra-body param. Budget must be
+            # >= 1024 and strictly less than max_tokens, so bump max_tokens
+            # when the caller's cap is too tight for thinking to fit.
+            if enable_thinking:
+                budget = max(1024, min(int(max_tokens * 0.75), 16_000))
+                if budget >= max_tokens:
+                    payload["max_tokens"] = budget + 1024
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                }
+                # Anthropic requires temperature == 1 with thinking enabled.
+                payload["temperature"] = 1.0
+                payload.pop("top_p", None)
         # Trace outgoing sampling params (no message content) at debug level;
         # invaluable when a provider seems to ignore a knob.
         logger.debug(

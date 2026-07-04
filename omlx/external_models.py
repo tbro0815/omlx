@@ -34,9 +34,30 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ("openrouter", "openai_compatible", "apple_fm")
+PROVIDERS = (
+    "openrouter",
+    "openai_compatible",
+    "apple_fm",
+    "anthropic",
+    "openai",
+    "claude_cli",
+    "codex_cli",
+)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Fixed endpoints for first-party API-key providers. Anthropic is reached
+# through its OpenAI-compatible layer so RemoteOpenAIEngine works unchanged.
+PRESET_BASE_URLS = {
+    "openrouter": OPENROUTER_BASE_URL,
+    "anthropic": "https://api.anthropic.com/v1",
+    "openai": "https://api.openai.com/v1",
+}
+
+# Subscription CLI relay providers: inference runs through the vendor's own
+# locally installed CLI (claude / codex) using the user's subscription login.
+# oMLX never sees or stores OAuth tokens — the CLIs manage their own auth.
+CLI_PROVIDERS = ("claude_cli", "codex_cli")
 
 _ID_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -78,6 +99,10 @@ def make_model_id(provider: str, remote_model: str) -> str:
     prefix = {
         "openrouter": "ext.or",
         "apple_fm": "ext.afm",
+        "anthropic": "ext.ant",
+        "openai": "ext.openai",
+        "claude_cli": "ext.claude",
+        "codex_cli": "ext.codex",
     }.get(provider, "ext.oai")
     return f"{prefix}.{flat}"
 
@@ -227,7 +252,13 @@ class ExternalModelRegistry:
             # AFM 3 is multimodal (image input); default the modality so
             # the chat UI enables image upload (model_type becomes "vlm").
             modality = modality or "text+image"
+        elif provider in CLI_PROVIDERS:
+            # Subscription relay through the vendor CLI: no endpoint, and
+            # explicitly no key — the CLI holds its own OAuth session.
+            base_url = f"cli://{provider.removesuffix('_cli')}"
+            api_key = None
         else:
+            base_url = base_url or PRESET_BASE_URLS.get(provider, "")
             base_url = base_url.rstrip("/")
             validate_not_self_endpoint(base_url, server_port)
         if not remote_model or not remote_model.strip():
