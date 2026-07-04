@@ -75,7 +75,7 @@ class TestRegistry:
         # metadata-refresh flow) doesn't force re-entering the key
         assert reg2.get_api_key("https://openrouter.ai/api/v1") == "sk-test"
 
-    def test_duplicate_add_rejected(self, tmp_path):
+    def test_duplicate_add_upserts(self, tmp_path):
         reg = ExternalModelRegistry(tmp_path)
         reg.add(
             provider="openrouter",
@@ -83,13 +83,17 @@ class TestRegistry:
             remote_model="x/y",
             server_port=8000,
         )
-        with pytest.raises(ValueError):
-            reg.add(
-                provider="openrouter",
-                base_url="https://openrouter.ai/api/v1",
-                remote_model="x/y",
-                server_port=8000,
-            )
+        # Re-adding the same provider+model refreshes metadata in place
+        # (same derived id), it must not error or duplicate.
+        m2 = reg.add(
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            remote_model="x/y",
+            server_port=8000,
+            context_length=123_456,
+        )
+        assert len(reg.list()) == 1
+        assert reg.get(m2.model_id).context_length == 123_456
 
     def test_no_secrets_in_records_file(self, tmp_path):
         reg = ExternalModelRegistry(tmp_path)

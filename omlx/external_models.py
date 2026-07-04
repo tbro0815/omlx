@@ -296,15 +296,17 @@ class ExternalModelRegistry:
             max_output_tokens=max_output_tokens,
             modality=modality,
         )
-        if model.model_id in self._models:
-            raise ValueError(f"External model already exists: {model.model_id}")
+        # Upsert: provider + remote_model determine the id, so a re-add is
+        # always a metadata refresh of the same model (the normal flow
+        # after catalog defaults improve), never a distinct entry.
+        replacing = model.model_id in self._models
         self._models[model.model_id] = model
         self._save()
         if api_key:
             self.set_api_key(base_url, api_key)
         logger.info(
-            f"Added external model {model.model_id} "
-            f"({provider} -> {remote_model} @ {base_url})"
+            f"{'Replaced' if replacing else 'Added'} external model "
+            f"{model.model_id} ({provider} -> {remote_model} @ {base_url})"
         )
         return model
 

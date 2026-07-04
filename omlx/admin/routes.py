@@ -6437,6 +6437,13 @@ async def add_external_model(
         raise HTTPException(status_code=400, detail=str(e))
 
     if engine_pool is not None:
+        # Re-adds are upserts: drop the old entry (unloading it if needed)
+        # so injection recreates it with the refreshed metadata.
+        entry = engine_pool.get_entry(model.model_id)
+        if entry is not None:
+            if entry.engine is not None:
+                await engine_pool._unload_engine(model.model_id)
+            engine_pool._entries.pop(model.model_id, None)
         engine_pool._inject_external_entries()
     return {"success": True, "model": model.to_dict()}
 
