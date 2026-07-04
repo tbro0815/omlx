@@ -292,6 +292,16 @@ class RemoteOpenAIEngine(BaseEngine):
         )
         if enable_thinking is not None and self._provider == "openrouter":
             payload["reasoning"] = {"enabled": bool(enable_thinking)}
+        # Trace outgoing sampling params (no message content) at debug level;
+        # invaluable when a provider seems to ignore a knob.
+        logger.debug(
+            "remote payload keys=%s reasoning=%r enable_thinking=%r "
+            "ct_kwargs=%r",
+            sorted(k for k in payload if k not in ("messages", "prompt")),
+            payload.get("reasoning"),
+            enable_thinking,
+            ct_kwargs,
+        )
         return payload
 
     async def _post_with_retries(self, path: str, payload: dict) -> httpx.Response:
