@@ -363,7 +363,15 @@ async def _run_single_test(
     if generation_duration_s is None:
         generation_duration_s = producer_generation_duration_s
 
-    generation_measured = generation_duration_s is not None
+    # Remote (external API) engines stream tokens in network bursts:
+    # per-token timing is meaningless (observed tg TPS in the millions).
+    # Report generation-side metrics as unmeasured; TTFT, E2E latency and
+    # total throughput remain honest end-to-end network numbers.
+    if getattr(engine, "model_type", None) == "remote":
+        generation_duration_s = None
+        generation_measured = False
+    else:
+        generation_measured = generation_duration_s is not None
 
     return _compute_single_metrics(
         prompt_tokens=prompt_tokens,

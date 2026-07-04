@@ -241,9 +241,9 @@
                                         <tr class="border-b border-neutral-100 hover:bg-neutral-50">
                                             <td class="px-4 py-3 font-medium text-neutral-900" x-text="'pp' + r.pp + '/tg' + r.tg"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.ttft_ms.toFixed(1)"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms.toFixed(2)"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.tpot_ms > 0 ? r.tpot_ms.toFixed(2) : '—'" :title="r.tpot_ms > 0 ? '' : 'Not measurable for network-streamed (external) models'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.processing_tps.toFixed(1) + ' tok/s'"></td>
-                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps.toFixed(1) + ' tok/s'"></td>
+                                            <td class="px-4 py-3 text-right tabular-nums font-medium text-neutral-900" x-text="r.gen_tps > 0 ? r.gen_tps.toFixed(1) + ' tok/s' : '—'" :title="r.gen_tps > 0 ? '' : 'Not measurable for network-streamed (external) models'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.e2e_latency_s.toFixed(3) + 's'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="r.total_throughput.toFixed(1) + ' tok/s'"></td>
                                             <td class="px-4 py-3 text-right tabular-nums text-neutral-700" x-text="benchFormatMemory(r.peak_memory_bytes)"></td>
