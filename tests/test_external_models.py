@@ -380,3 +380,94 @@ class TestAppleFMEngine:
         assert deltas == ["1, 2", ", 3", "."]
         assert outputs[-1].finished is True
         assert outputs[-1].text == "1, 2, 3."
+
+
+class TestAppleFMImages:
+    def _engine_with_image_sdk(self):
+        import types
+
+        from omlx.engine.apple_fm import AppleFMEngine
+
+        fake = types.ModuleType("apple_fm_sdk")
+
+        class FakeOptions:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        class FakeSamplingMode:
+            greedy = "greedy"
+
+        class FakeImageAttachment:
+            def __init__(self, path, label=None):
+                self.path = str(path)
+                self.label = label
+
+        class FakeSession:
+            last = None
+
+            def __init__(self, instructions=None, model=None, tools=None):
+                self.instructions = instructions
+                FakeSession.last = self
+
+            async def respond(self, prompt, options=None, **kw):
+                self.prompt = prompt
+                return "a cat"
+
+        fake.GenerationOptions = FakeOptions
+        fake.SamplingMode = FakeSamplingMode
+        fake.ImageAttachment = FakeImageAttachment
+        fake.LanguageModelSession = FakeSession
+
+        engine = AppleFMEngine(model_name="ext.afm.on-device")
+        engine._fm = fake
+        engine._model = object()
+        engine._loaded = True
+        return engine, FakeSession, FakeImageAttachment
+
+    async def test_data_url_image_becomes_attachment(self):
+        import base64
+        import os
+
+        engine, FakeSession, FakeImageAttachment = self._engine_with_image_sdk()
+        png = base64.b64encode(b"\x89PNG fakebytes").decode()
+        out = await engine.chat(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{png}"},
+                        },
+                    ],
+                }
+            ],
+        )
+        assert out.text == "a cat"
+        prompt = FakeSession.last.prompt
+        assert isinstance(prompt, list) and prompt[0] == "What is this?"
+        assert isinstance(prompt[1], FakeImageAttachment)
+        assert prompt[1].label == "image_1"
+        # temp file cleaned up after the request
+        assert not os.path.exists(prompt[1].path)
+
+    async def test_history_images_become_placeholders(self):
+        engine, FakeSession, FakeImageAttachment = self._engine_with_image_sdk()
+        await engine.chat(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": "https://x/old.png"}},
+                    ],
+                },
+                {"role": "assistant", "content": "seen"},
+                {"role": "user", "content": "and now?"},
+            ],
+        )
+        prompt = FakeSession.last.prompt
+        # last user turn has no images -> plain text dialogue with placeholder
+        assert isinstance(prompt, str)
+        assert "[image]" in prompt and "and now?" in prompt

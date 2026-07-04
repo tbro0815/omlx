@@ -104,7 +104,7 @@ class AppleFMEngine(BaseEngine):
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         is_partial: bool | None = None,
     ) -> int:
-        instructions, prompt = self._flatten_messages(messages)
+        instructions, prompt, _images = self._flatten_messages(messages)
         return self.count_tokens((instructions or "") + prompt)
 
     def get_stats(self) -> Dict[str, Any]:
@@ -181,25 +181,52 @@ class AppleFMEngine(BaseEngine):
     # ── prompt/options mapping ────────────────────────────────────────
 
     @staticmethod
+    def _image_refs(content: Any) -> list[str]:
+        """Extract image URL/data-URL refs from an OpenAI content list."""
+        refs: list[str] = []
+        if isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") in ("image_url", "input_image", "image"):
+                    iu = b.get("image_url") or b.get("url") or b.get("image")
+                    if isinstance(iu, dict):
+                        iu = iu.get("url")
+                    if isinstance(iu, str) and iu:
+                        refs.append(iu)
+        return refs
+
+    @staticmethod
     def _flatten_messages(
         messages: List[Dict[str, Any]],
-    ) -> tuple[Optional[str], str]:
-        """Split messages into (instructions, prompt).
+    ) -> tuple[Optional[str], str, list[str]]:
+        """Split messages into (instructions, prompt_text, image_refs).
 
         System messages become session instructions. Multi-turn history is
         flattened into a role-tagged dialogue; a single user message passes
         through untagged (the common benchmark case).
+
+        Images: only the LAST user message's images are attached (older
+        images are represented as "[image]" placeholders in the flattened
+        history) — matching the fast-classifier / single-shot vision use
+        case without ballooning session state.
         """
 
         def _text(content: Any) -> str:
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
-                return " ".join(
-                    str(b.get("text") or "")
-                    for b in content
-                    if isinstance(b, dict)
-                )
+                parts = []
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") in ("image_url", "input_image", "image"):
+                        parts.append("[image]")
+                    else:
+                        t = b.get("text")
+                        if t:
+                            parts.append(str(t))
+                return " ".join(parts)
             return str(content or "")
 
         system_parts = [
@@ -211,8 +238,24 @@ class AppleFMEngine(BaseEngine):
 
         instructions = "\n\n".join(p for p in system_parts if p) or None
 
+        # Images from the last user turn only.
+        image_refs: list[str] = []
+        for m in reversed(turns):
+            if m.get("role") == "user":
+                image_refs = AppleFMEngine._image_refs(m.get("content"))
+                break
+
         if len(turns) == 1 and turns[0].get("role") == "user":
-            prompt = _text(turns[0].get("content"))
+            content = turns[0].get("content")
+            if isinstance(content, str):
+                prompt = content
+            else:
+                # keep only the text; images travel as attachments
+                prompt = " ".join(
+                    str(b.get("text") or "")
+                    for b in (content or [])
+                    if isinstance(b, dict) and b.get("text")
+                )
         else:
             labels = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
             lines = [
@@ -222,7 +265,77 @@ class AppleFMEngine(BaseEngine):
             ]
             lines.append("Assistant:")
             prompt = "\n".join(lines)
-        return instructions, prompt
+        return instructions, prompt, image_refs
+
+    async def _materialize_images(
+        self, image_refs: list[str], temp_paths: list
+    ) -> list:
+        """Turn image refs into fm.ImageAttachment objects.
+
+        Supports data URLs (base64), http(s) URLs, and existing local file
+        paths. Downloaded/decoded images land in temp files that the caller
+        removes after the request (tracked via ``temp_paths``).
+        """
+        import base64
+        import re as _re
+        import tempfile
+        from pathlib import Path as _Path
+
+        attachments = []
+        for idx, ref in enumerate(image_refs):
+            path: Optional[str] = None
+            if ref.startswith("data:"):
+                m = _re.match(r"data:image/(\w+);base64,(.*)", ref, _re.DOTALL)
+                if not m:
+                    raise RuntimeError(
+                        "Unsupported image data URL (expected base64 image/*)"
+                    )
+                suffix = "." + (m.group(1).lower() or "png").replace("jpeg", "jpg")
+                data = base64.b64decode(m.group(2))
+                tf = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=suffix, prefix="omlx-afm-"
+                )
+                tf.write(data)
+                tf.close()
+                path = tf.name
+                temp_paths.append(path)
+            elif ref.startswith(("http://", "https://")):
+                import httpx
+
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(ref)
+                    resp.raise_for_status()
+                ctype = resp.headers.get("Content-Type", "image/png")
+                suffix = "." + ctype.split("/")[-1].split(";")[0].replace(
+                    "jpeg", "jpg"
+                )
+                tf = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=suffix, prefix="omlx-afm-"
+                )
+                tf.write(resp.content)
+                tf.close()
+                path = tf.name
+                temp_paths.append(path)
+            elif ref.startswith("file://"):
+                path = ref[7:]
+            elif _Path(ref).exists():
+                path = ref
+            else:
+                raise RuntimeError(f"Unsupported image reference: {ref[:80]}")
+            attachments.append(
+                self._fm.ImageAttachment(_Path(path), label=f"image_{idx + 1}")
+            )
+        return attachments
+
+    @staticmethod
+    def _cleanup_temp(temp_paths: list) -> None:
+        import os as _os
+
+        for p in temp_paths:
+            try:
+                _os.unlink(p)
+            except OSError:
+                pass
 
     def _build_options(self, max_tokens: int, temperature: float):
         fm = self._fm
@@ -277,14 +390,23 @@ class AppleFMEngine(BaseEngine):
         prompt: str,
         max_tokens: int,
         temperature: float,
+        image_refs: Optional[list[str]] = None,
     ) -> GenerationOutput:
         options = self._build_options(max_tokens, temperature)
         prompt_est = self.count_tokens((instructions or "") + prompt)
+        temp_paths: list = []
         async with self._request_lock:
             self._active_requests += 1
             try:
                 session = self._make_session(instructions)
-                text = await session.respond(prompt=prompt, options=options)
+                if image_refs:
+                    attachments = await self._materialize_images(
+                        image_refs, temp_paths
+                    )
+                    fm_prompt: Any = [prompt, *attachments]
+                else:
+                    fm_prompt = prompt
+                text = await session.respond(prompt=fm_prompt, options=options)
                 text = str(text)
                 finish = "stop"
             except Exception as e:  # noqa: BLE001 - map SDK errors
@@ -293,6 +415,7 @@ class AppleFMEngine(BaseEngine):
                     raise RuntimeError(text) from e
             finally:
                 self._active_requests -= 1
+                self._cleanup_temp(temp_paths)
         return GenerationOutput(
             text=text,
             prompt_tokens=prompt_est,
@@ -306,17 +429,26 @@ class AppleFMEngine(BaseEngine):
         prompt: str,
         max_tokens: int,
         temperature: float,
+        image_refs: Optional[list[str]] = None,
     ) -> AsyncIterator[GenerationOutput]:
         options = self._build_options(max_tokens, temperature)
         prompt_est = self.count_tokens((instructions or "") + prompt)
         accum = ""
         finish = "stop"
+        temp_paths: list = []
         async with self._request_lock:
             self._active_requests += 1
             try:
                 session = self._make_session(instructions)
+                if image_refs:
+                    attachments = await self._materialize_images(
+                        image_refs, temp_paths
+                    )
+                    fm_prompt: Any = [prompt, *attachments]
+                else:
+                    fm_prompt = prompt
                 async for snapshot in session.stream_response(
-                    prompt=prompt, options=options
+                    prompt=fm_prompt, options=options
                 ):
                     snapshot = str(snapshot)
                     # SDK streams CUMULATIVE snapshots; diff to get deltas.
@@ -342,6 +474,7 @@ class AppleFMEngine(BaseEngine):
                 accum = accum or msg
             finally:
                 self._active_requests -= 1
+                self._cleanup_temp(temp_paths)
         yield GenerationOutput(
             text=accum,
             new_text="",
@@ -397,9 +530,9 @@ class AppleFMEngine(BaseEngine):
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> GenerationOutput:
-        instructions, prompt = self._flatten_messages(messages)
+        instructions, prompt, image_refs = self._flatten_messages(messages)
         return await self._respond_once(
-            instructions, prompt, max_tokens, temperature
+            instructions, prompt, max_tokens, temperature, image_refs
         )
 
     async def stream_chat(
@@ -415,8 +548,8 @@ class AppleFMEngine(BaseEngine):
         tools: Optional[List[dict]] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
-        instructions, prompt = self._flatten_messages(messages)
+        instructions, prompt, image_refs = self._flatten_messages(messages)
         async for out in self._stream_once(
-            instructions, prompt, max_tokens, temperature
+            instructions, prompt, max_tokens, temperature, image_refs
         ):
             yield out
