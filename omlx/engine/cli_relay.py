@@ -35,7 +35,7 @@ import json
 import logging
 import os
 import shutil
-import tempfile
+
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .base import BaseEngine, GenerationOutput
@@ -218,17 +218,54 @@ class CLIRelayEngine(BaseEngine):
         # Use the resolved absolute path: the bare name may not be on the
         # server process's minimal PATH even though the CLI is installed.
         self._binary = detail
-        self._scratch_dir = tempfile.mkdtemp(prefix="omlx-cli-relay-")
+        # Stable, empty working directory (NOT a fresh tempdir): Claude
+        # Code shows a folder-trust dialog for unknown cwds, which print
+        # mode cannot render — the subprocess hangs forever. A fixed dir
+        # needs trusting exactly once, and we pre-seed that below.
+        stable = os.path.join(os.path.expanduser("~/.omlx"), "cli-relay")
+        os.makedirs(stable, exist_ok=True)
+        self._scratch_dir = stable
+        if self._provider == "claude_cli":
+            self._ensure_claude_trust(stable)
         self._loaded = True
         logger.info(
             f"CLIRelayEngine started: {self._model_name} -> "
             f"{self._binary} ({self._remote_model})"
         )
 
+    @staticmethod
+    def _ensure_claude_trust(cwd: str) -> None:
+        """Pre-seed Claude Code's folder-trust entry for the relay cwd.
+
+        The trust dialog cannot be answered in print mode, so an
+        untrusted cwd hangs every ``claude -p`` call. Marking the relay's
+        dedicated (always empty) directory as trusted in ~/.claude.json
+        is equivalent to the user answering the dialog once, scoped to a
+        folder oMLX controls. Best-effort: unparseable/missing config is
+        left alone.
+        """
+        cfg = os.path.expanduser("~/.claude.json")
+        try:
+            with open(cfg) as f:
+                data = json.load(f)
+            projects = data.setdefault("projects", {})
+            entry = projects.setdefault(cwd, {})
+            if entry.get("hasTrustDialogAccepted") is True:
+                return
+            entry["hasTrustDialogAccepted"] = True
+            entry.setdefault("hasCompletedProjectOnboarding", True)
+            tmp = cfg + ".omlx-tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, cfg)
+            logger.info(f"Marked {cwd} as trusted for Claude Code print mode")
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not pre-seed Claude Code trust: {e}")
+
     async def stop(self) -> None:
-        if self._scratch_dir:
-            shutil.rmtree(self._scratch_dir, ignore_errors=True)
-            self._scratch_dir = None
+        # The stable relay dir persists across engine restarts (its trust
+        # registration is the point); nothing to clean up.
+        self._scratch_dir = None
         self._loaded = False
         logger.info(f"CLIRelayEngine stopped: {self._model_name}")
 
