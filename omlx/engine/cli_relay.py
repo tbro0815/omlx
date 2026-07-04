@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -43,6 +44,24 @@ from .remote import _ApproxTokenizer
 logger = logging.getLogger(__name__)
 
 _CLI_BINARIES = {"claude_cli": "claude", "codex_cli": "codex"}
+
+# Environment variables scrubbed from the child process. These override
+# the CLI's own subscription login (e.g. ANTHROPIC_API_KEY makes claude
+# bill the API key instead of the claude.ai session — the opposite of
+# what a *subscription* relay promises) and can wedge the CLI entirely.
+_SCRUBBED_ENV = {
+    "claude_cli": (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ),
+    "codex_cli": (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+    ),
+}
 
 # Friendly hints for the most common failure modes.
 _LOGIN_HINTS = {
@@ -317,12 +336,15 @@ class CLIRelayEngine(BaseEngine):
         # can block forever on an inherited descriptor that never EOFs
         # (observed as a bench stuck in 'starting' under the service
         # environment).
+        scrub = _SCRUBBED_ENV.get(self._provider, ())
+        env = {k: v for k, v in os.environ.items() if k not in scrub}
         return await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._scratch_dir,
+            env=env,
         )
 
     def _friendly_error(self, returncode: int, stderr: str) -> RuntimeError:
