@@ -97,7 +97,7 @@
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
-                                        <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
+                                        <option :value="m.id" x-text="m.id + (m.estimated_size ? ' (' + (m.estimated_size / 1073741824).toFixed(1) + ' GB)' : '')"></option>
                                     </template>
                                 </select>
                             </div>
