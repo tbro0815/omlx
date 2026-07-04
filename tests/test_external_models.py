@@ -799,3 +799,108 @@ class TestCLIRelay:
         assert instructions == "Terse."
         assert "user: One" in prompt and "assistant: Two" in prompt
         assert prompt.endswith("Reply directly to this message: Three")
+
+
+class TestOpenAIProviderQuirks:
+    def _openai_engine(self, handler) -> RemoteOpenAIEngine:
+        engine = RemoteOpenAIEngine(
+            model_name="ext.openai.gpt-5.4-mini",
+            base_url="https://api.openai.com/v1",
+            remote_model="gpt-5.4-mini",
+            api_key="sk-test",
+            provider="openai",
+        )
+
+        async def _start():
+            engine._client = httpx.AsyncClient(
+                base_url="https://api.openai.com/v1",
+                transport=httpx.MockTransport(handler),
+            )
+            engine._loaded = True
+
+        engine.start = _start
+        return engine
+
+    async def test_openai_sends_max_completion_tokens(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}}
+            )
+
+        engine = self._openai_engine(handler)
+        await engine.start()
+        await engine.chat(
+            messages=[{"role": "user", "content": "hi"}], max_tokens=128
+        )
+        assert seen["max_completion_tokens"] == 128
+        assert "max_tokens" not in seen
+        await engine.stop()
+
+    async def test_unsupported_param_is_dropped_and_retried(self):
+        bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "temperature" in body:
+                return httpx.Response(
+                    400,
+                    json={"error": {"message": (
+                        "Unsupported value: 'temperature' does not support "
+                        "0.7 with this model. Only the default (1) is "
+                        "supported."
+                    )}},
+                )
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}}
+            )
+
+        engine = self._openai_engine(handler)
+        await engine.start()
+        out = await engine.chat(
+            messages=[{"role": "user", "content": "hi"}], temperature=0.7
+        )
+        assert out.text == "ok"
+        assert len(bodies) == 2
+        assert "temperature" in bodies[0] and "temperature" not in bodies[1]
+        await engine.stop()
+
+    async def test_stream_adapts_max_tokens_rename(self):
+        bodies = []
+        sse = (
+            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "max_tokens" in body:
+                return httpx.Response(
+                    400,
+                    json={"error": {"message": (
+                        "Unsupported parameter: 'max_tokens' is not "
+                        "supported with this model. Use "
+                        "'max_completion_tokens' instead."
+                    )}},
+                )
+            return httpx.Response(
+                200, content=sse.encode(),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        # openrouter provider so max_tokens survives _sampling_payload and
+        # the rename path is exercised end-to-end via the 400 handler
+        engine = _mock_engine(handler)
+        await engine.start()
+        final = None
+        async for out in engine.stream_chat(
+            messages=[{"role": "user", "content": "hi"}], max_tokens=64
+        ):
+            final = out
+        assert final.text == "ok"
+        assert "max_completion_tokens" in bodies[-1]
+        await engine.stop()

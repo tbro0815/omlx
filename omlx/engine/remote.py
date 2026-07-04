@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -37,6 +38,15 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 3
+
+# OpenAI-style parameter rejections, e.g.:
+#   "Unsupported parameter: 'max_tokens' is not supported with this model.
+#    Use 'max_completion_tokens' instead."
+#   "Unsupported value: 'temperature' does not support 0.7 with this model.
+#    Only the default (1) is supported."
+_UNSUPPORTED_PARAM_RE = re.compile(
+    r"[Uu]nsupported (?:parameter|value): '([\w.]+)'"
+)
 
 
 class _ApproxTokenizer:
@@ -273,6 +283,11 @@ class RemoteOpenAIEngine(BaseEngine):
             "temperature": temperature,
             "top_p": top_p,
         }
+        if self._provider == "openai":
+            # Current OpenAI models reject max_tokens on chat completions
+            # in favor of max_completion_tokens (which older models also
+            # accept), so send the new name unconditionally.
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
         if presence_penalty:
             payload["presence_penalty"] = presence_penalty
         freq = kwargs.get("frequency_penalty", 0.0)
@@ -331,6 +346,36 @@ class RemoteOpenAIEngine(BaseEngine):
         )
         return payload
 
+    def _adapt_payload_for_error(self, payload: dict, detail: str) -> bool:
+        """Drop/rename a parameter the provider rejected; True if changed.
+
+        Providers (notably OpenAI) reject requests outright when a model
+        doesn't support a sampling parameter. Rather than hardcoding every
+        model family's quirks, parse the rejection and retry once without
+        the offending knob (or with the suggested replacement name).
+        """
+        m = _UNSUPPORTED_PARAM_RE.search(detail or "")
+        if not m:
+            return False
+        param = m.group(1)
+        if param == "max_tokens" and "max_completion_tokens" in detail:
+            if "max_tokens" in payload:
+                payload["max_completion_tokens"] = payload.pop("max_tokens")
+                logger.info(
+                    f"{self._model_name}: provider wants "
+                    f"max_completion_tokens; renamed and retrying"
+                )
+                return True
+            return False
+        if param in payload:
+            payload.pop(param)
+            logger.info(
+                f"{self._model_name}: provider rejected {param!r} for "
+                f"{self._remote_model}; dropped it and retrying"
+            )
+            return True
+        return False
+
     async def _post_with_retries(self, path: str, payload: dict) -> httpx.Response:
         assert self._client is not None, "engine not started"
         last: httpx.Response | None = None
@@ -339,6 +384,10 @@ class RemoteOpenAIEngine(BaseEngine):
             if resp.status_code < 400:
                 return resp
             last = resp
+            if resp.status_code == 400 and self._adapt_payload_for_error(
+                payload, self._error_detail(resp)
+            ):
+                continue
             if resp.status_code not in _RETRYABLE_STATUS:
                 break
             retry_after = resp.headers.get("Retry-After")
@@ -352,17 +401,20 @@ class RemoteOpenAIEngine(BaseEngine):
         self._raise_api_error(last)
         raise RuntimeError("unreachable")
 
-    def _raise_api_error(self, resp: httpx.Response) -> None:
-        detail = ""
+    @staticmethod
+    def _error_detail(resp: httpx.Response) -> str:
         try:
             body = resp.json()
-            detail = (
+            return (
                 body.get("error", {}).get("message")
                 if isinstance(body.get("error"), dict)
                 else body.get("error")
             ) or ""
         except Exception:  # noqa: BLE001
-            detail = resp.text[:300]
+            return resp.text[:300]
+
+    def _raise_api_error(self, resp: httpx.Response) -> None:
+        detail = self._error_detail(resp)
         raise RuntimeError(
             f"Remote API error {resp.status_code} for "
             f"{self._remote_model}: {detail}"
@@ -574,7 +626,25 @@ class RemoteOpenAIEngine(BaseEngine):
 
         self._active_requests += 1
         try:
-            async with self._client.stream("POST", path, json=payload) as resp:
+            # Mirror _post_with_retries' parameter adaptation: a 400 for an
+            # unsupported sampling param arrives before any SSE data, so it
+            # is safe to fix the payload and reopen the stream.
+            for _adapt_attempt in range(_MAX_RETRIES):
+                probe = await self._client.send(
+                    self._client.build_request("POST", path, json=payload),
+                    stream=True,
+                )
+                if probe.status_code == 400:
+                    await probe.aread()
+                    await probe.aclose()
+                    if self._adapt_payload_for_error(
+                        payload, self._error_detail(probe)
+                    ):
+                        continue
+                    self._raise_api_error(probe)
+                break
+            resp = probe
+            try:
                 if resp.status_code >= 400:
                     await resp.aread()
                     self._raise_api_error(resp)
@@ -644,6 +714,8 @@ class RemoteOpenAIEngine(BaseEngine):
                             completion_tokens=completion_t,
                             cached_tokens=cached_t,
                         )
+            finally:
+                await resp.aclose()
         finally:
             self._active_requests -= 1
 
