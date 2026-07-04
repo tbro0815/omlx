@@ -28,8 +28,10 @@
                     <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded uppercase tracking-wide"
                           :class="model.provider === 'openrouter'
                               ? 'bg-indigo-50 text-indigo-600 border border-indigo-200'
-                              : 'bg-teal-50 text-teal-600 border border-teal-200'"
-                          x-text="model.provider === 'openrouter' ? 'OpenRouter' : 'OpenAI-compat'"></span>
+                              : (model.provider === 'apple_fm'
+                                  ? 'bg-neutral-100 text-neutral-700 border border-neutral-300'
+                                  : 'bg-teal-50 text-teal-600 border border-teal-200')"
+                          x-text="model.provider === 'openrouter' ? 'OpenRouter' : (model.provider === 'apple_fm' ? 'Apple FM' : 'OpenAI-compat')"></span>
                     <span class="text-sm font-medium text-neutral-900 truncate"
                           :title="model.remote_model"
                           x-text="model.display_name || model.remote_model"></span>
@@ -38,7 +40,7 @@
                         <span class="text-xs text-neutral-400 flex-shrink-0"
                               x-text="'(' + Math.round(model.context_length / 1024) + 'k ctx)'"></span>
                     </template>
-                    <template x-if="!model.has_api_key">
+                    <template x-if="!model.has_api_key && model.provider !== 'apple_fm'">
                         <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">no key</span>
                     </template>
                     <template x-if="model.loaded">
@@ -83,7 +85,7 @@
             <!-- Provider -->
             <div>
                 <label class="block text-xs font-medium text-neutral-500 mb-1.5">Provider</label>
-                <div class="grid grid-cols-2 gap-2">
+                <div class="grid grid-cols-3 gap-2">
                     <button @click="extProvider = 'openrouter'; extCatalog = []; extError = ''"
                             :class="extProvider === 'openrouter'
                                 ? 'border-neutral-900 bg-neutral-900 text-white'
@@ -97,6 +99,13 @@
                                 : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
                             class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
                         OpenAI-compatible
+                    </button>
+                    <button @click="extProvider = 'apple_fm'; extCatalog = []; extError = ''; extRemoteModel = 'on-device'"
+                            :class="extProvider === 'apple_fm'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Apple FM
                     </button>
                 </div>
             </div>
@@ -112,8 +121,17 @@
             <div x-show="extProvider === 'openrouter'">
                 <p class="text-[11px] text-neutral-400">Endpoint: https://openrouter.ai/api/v1</p>
             </div>
+            <div x-show="extProvider === 'apple_fm'">
+                <p class="text-[11px] text-neutral-400">
+                    On-device Apple Intelligence model via the official Python SDK.
+                    No API key — requires macOS 26+, Xcode 26+ (SDK agreement accepted),
+                    Apple Intelligence enabled, and <span class="font-mono">apple-fm-sdk</span>
+                    installed in the oMLX environment. AFM 3 Cloud / Cloud Pro are not
+                    developer-accessible through Apple's SDK (yet).
+                </p>
+            </div>
             <!-- API key -->
-            <div>
+            <div x-show="extProvider !== 'apple_fm'">
                 <label class="block text-xs font-medium text-neutral-500 mb-1.5">API key</label>
                 <input type="password" x-model="extApiKey" placeholder="sk-…  (stored locally, 0600)"
                        autocomplete="off"

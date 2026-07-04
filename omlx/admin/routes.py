@@ -6470,6 +6470,43 @@ async def external_model_catalog(
     registry = _get_external_registry()
     body = await request.json()
     provider = (body.get("provider") or "").strip()
+
+    if provider == "apple_fm":
+        # In-process SDK: report availability instead of fetching a catalog.
+        try:
+            import apple_fm_sdk as fm
+        except ImportError:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "apple-fm-sdk is not installed in the oMLX environment. "
+                    "Install with: \"$(brew --prefix omlx)/libexec/bin/pip\" "
+                    "install apple-fm-sdk (requires macOS 26+, Xcode 26+, "
+                    "Apple Intelligence enabled)."
+                ),
+            )
+        model = fm.SystemLanguageModel()
+        is_available, reason = model.is_available()
+        if not is_available:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Apple Foundation Models unavailable: "
+                    f"{getattr(reason, 'name', reason)}"
+                ),
+            )
+        return {
+            "models": [
+                {
+                    "id": "on-device",
+                    "name": "Apple Intelligence (on-device AFM)",
+                    "context_length": None,
+                    "modality": "text+image",
+                }
+            ],
+            "base_url": "applefm://local",
+        }
+
     base_url = (body.get("base_url") or "").strip()
     if provider == "openrouter" and not base_url:
         base_url = OPENROUTER_BASE_URL

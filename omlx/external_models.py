@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ("openrouter", "openai_compatible")
+PROVIDERS = ("openrouter", "openai_compatible", "apple_fm")
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -75,7 +75,10 @@ def make_model_id(provider: str, remote_model: str) -> str:
     provider model ids (e.g. "deepseek/deepseek-v4") are flattened.
     """
     flat = _ID_SANITIZE_RE.sub("-", remote_model.replace("/", "-"))
-    prefix = "ext.or" if provider == "openrouter" else "ext.oai"
+    prefix = {
+        "openrouter": "ext.or",
+        "apple_fm": "ext.afm",
+    }.get(provider, "ext.oai")
     return f"{prefix}.{flat}"
 
 
@@ -217,8 +220,13 @@ class ExternalModelRegistry:
     ) -> ExternalModel:
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown provider {provider!r}; expected {PROVIDERS}")
-        base_url = base_url.rstrip("/")
-        validate_not_self_endpoint(base_url, server_port)
+        if provider == "apple_fm":
+            # In-process SDK: no endpoint, no key, nothing to validate.
+            base_url = "applefm://local"
+            api_key = None
+        else:
+            base_url = base_url.rstrip("/")
+            validate_not_self_endpoint(base_url, server_port)
         if not remote_model or not remote_model.strip():
             raise ValueError("remote_model must not be empty")
 

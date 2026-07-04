@@ -388,13 +388,20 @@ class EnginePool:
             del self._entries[mid]
 
     def _build_remote_engine(self, model_id: str):
-        """Construct a RemoteOpenAIEngine from the external registry record."""
+        """Construct the engine for an external registry record."""
         from .engine.remote import RemoteOpenAIEngine
 
         registry = getattr(self, "_external_registry", None)
         record = registry.get(model_id) if registry is not None else None
         if record is None:
             raise ModelNotFoundError(model_id)
+        if record.provider == "apple_fm":
+            from .engine.apple_fm import AppleFMEngine
+
+            return AppleFMEngine(
+                model_name=model_id,
+                variant=record.remote_model,
+            )
         return RemoteOpenAIEngine(
             model_name=model_id,
             base_url=record.base_url,

@@ -277,3 +277,106 @@ class TestRemoteEngine:
             final = out
         assert final.text == "<think>hmm more</think>Answer"
         await engine.stop()
+
+
+class TestAppleFMRegistry:
+    def test_apple_fm_add_needs_no_endpoint_or_key(self, tmp_path):
+        reg = ExternalModelRegistry(tmp_path)
+        m = reg.add(
+            provider="apple_fm",
+            base_url="",
+            remote_model="on-device",
+            server_port=8000,
+        )
+        assert m.model_id == "ext.afm.on-device"
+        assert m.base_url == "applefm://local"
+        assert reg.get_api_key(m.base_url) is None
+
+
+class TestAppleFMEngine:
+    def _engine_with_fake_sdk(self, chunks):
+        """Build an AppleFMEngine wired to a fake apple_fm_sdk module."""
+        import types
+
+        from omlx.engine.apple_fm import AppleFMEngine
+
+        fake = types.ModuleType("apple_fm_sdk")
+
+        class FakeOptions:
+            def __init__(self, sampling=None, temperature=None,
+                         maximum_response_tokens=None):
+                self.sampling = sampling
+                self.temperature = temperature
+                self.maximum_response_tokens = maximum_response_tokens
+
+        class FakeSamplingMode:
+            greedy = "greedy"
+
+        class FakeSession:
+            last = None
+
+            def __init__(self, instructions=None, model=None, tools=None):
+                self.instructions = instructions
+                FakeSession.last = self
+
+            async def respond(self, prompt, options=None, **kw):
+                self.prompt = prompt
+                self.options = options
+                return "respuesta"
+
+            async def stream_response(self, prompt, options=None):
+                self.prompt = prompt
+                for c in chunks:
+                    yield c
+
+        fake.GenerationOptions = FakeOptions
+        fake.SamplingMode = FakeSamplingMode
+        fake.LanguageModelSession = FakeSession
+
+        engine = AppleFMEngine(model_name="ext.afm.on-device")
+        engine._fm = fake
+        engine._model = object()
+        engine._loaded = True
+        return engine, FakeSession
+
+    async def test_chat_splits_system_into_instructions(self):
+        engine, FakeSession = self._engine_with_fake_sdk([])
+        out = await engine.chat(
+            messages=[
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Hola!"},
+            ],
+            max_tokens=64,
+            temperature=0.0,
+        )
+        assert out.text == "respuesta"
+        assert FakeSession.last.instructions == "Be terse."
+        assert FakeSession.last.prompt == "Hola!"
+        # temperature 0 -> greedy sampling, max tokens mapped
+        assert FakeSession.last.options.sampling == "greedy"
+        assert FakeSession.last.options.maximum_response_tokens == 64
+
+    async def test_multi_turn_flattening(self):
+        engine, FakeSession = self._engine_with_fake_sdk([])
+        await engine.chat(
+            messages=[
+                {"role": "user", "content": "One"},
+                {"role": "assistant", "content": "Two"},
+                {"role": "user", "content": "Three"},
+            ],
+        )
+        prompt = FakeSession.last.prompt
+        assert "User: One" in prompt and "Assistant: Two" in prompt
+        assert prompt.endswith("Assistant:")
+
+    async def test_stream_diffs_cumulative_snapshots(self):
+        engine, _ = self._engine_with_fake_sdk(["1, 2", "1, 2, 3", "1, 2, 3."])
+        outputs = []
+        async for out in engine.stream_chat(
+            messages=[{"role": "user", "content": "count"}]
+        ):
+            outputs.append(out)
+        deltas = [o.new_text for o in outputs if not o.finished]
+        assert deltas == ["1, 2", ", 3", "."]
+        assert outputs[-1].finished is True
+        assert outputs[-1].text == "1, 2, 3."
