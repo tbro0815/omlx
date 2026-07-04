@@ -47,6 +47,12 @@ _MAX_RETRIES = 3
 _UNSUPPORTED_PARAM_RE = re.compile(
     r"[Uu]nsupported (?:parameter|value): '([\w.]+)'"
 )
+# Anthropic-style mutual-exclusion rejections, e.g.:
+#   "`temperature` and `top_p` cannot both be specified for this model.
+#    Please use only one."
+_MUTUALLY_EXCLUSIVE_RE = re.compile(
+    r"`(\w+)` and `(\w+)` cannot both be specified"
+)
 
 
 class _ApproxTokenizer:
@@ -288,6 +294,11 @@ class RemoteOpenAIEngine(BaseEngine):
             # in favor of max_completion_tokens (which older models also
             # accept), so send the new name unconditionally.
             payload["max_completion_tokens"] = payload.pop("max_tokens")
+        elif self._provider == "anthropic":
+            # Current Claude models reject temperature and top_p supplied
+            # together; temperature is the knob oMLX's flows drive, so
+            # keep it and drop top_p.
+            payload.pop("top_p", None)
         if presence_penalty:
             payload["presence_penalty"] = presence_penalty
         freq = kwargs.get("frequency_penalty", 0.0)
@@ -354,6 +365,20 @@ class RemoteOpenAIEngine(BaseEngine):
         model family's quirks, parse the rejection and retry once without
         the offending knob (or with the suggested replacement name).
         """
+        mx = _MUTUALLY_EXCLUSIVE_RE.search(detail or "")
+        if mx:
+            first, second = mx.group(1), mx.group(2)
+            # Prefer dropping the sampling-shape knob over temperature.
+            drop = second if second != "temperature" else first
+            if drop in payload:
+                payload.pop(drop)
+                logger.info(
+                    f"{self._model_name}: {first!r}/{second!r} are mutually "
+                    f"exclusive for {self._remote_model}; dropped {drop!r} "
+                    f"and retrying"
+                )
+                return True
+            return False
         m = _UNSUPPORTED_PARAM_RE.search(detail or "")
         if not m:
             return False

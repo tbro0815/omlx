@@ -904,3 +904,58 @@ class TestOpenAIProviderQuirks:
         assert final.text == "ok"
         assert "max_completion_tokens" in bodies[-1]
         await engine.stop()
+
+
+class TestAnthropicSamplingQuirks:
+    async def test_anthropic_drops_top_p_proactively(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}}
+            )
+
+        engine = _anthropic_mock_engine(handler)
+        await engine.start()
+        await engine.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.7,
+            top_p=0.9,
+        )
+        assert "top_p" not in seen
+        assert seen["temperature"] == 0.7
+        await engine.stop()
+
+    async def test_mutually_exclusive_rejection_drops_top_p_and_retries(self):
+        bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "top_p" in body:
+                return httpx.Response(
+                    400,
+                    json={"error": {"message": (
+                        "`temperature` and `top_p` cannot both be specified "
+                        "for this model. Please use only one."
+                    )}},
+                )
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}}
+            )
+
+        # openrouter provider: both knobs survive _sampling_payload, so the
+        # adaptive-retry path (not the proactive drop) is exercised
+        engine = _mock_engine(handler)
+        await engine.start()
+        out = await engine.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.7,
+            top_p=0.9,
+        )
+        assert out.text == "ok"
+        assert len(bodies) == 2
+        assert "top_p" in bodies[0] and "top_p" not in bodies[1]
+        assert bodies[1]["temperature"] == 0.7
+        await engine.stop()
