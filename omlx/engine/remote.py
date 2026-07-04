@@ -278,6 +278,20 @@ class RemoteOpenAIEngine(BaseEngine):
                 payload["min_p"] = min_p
             if repetition_penalty and repetition_penalty != 1.0:
                 payload["repetition_penalty"] = repetition_penalty
+
+        # Thinking toggle: local flows pass enable_thinking via
+        # chat_template_kwargs (rendered into the template for local
+        # models). Remote providers apply their own template, so the flag
+        # must travel as an API parameter instead — otherwise reasoning
+        # models (e.g. GLM) think even when the benchmark/chat toggle is
+        # off. OpenRouter normalizes this across vendors via the unified
+        # "reasoning" parameter; None (auto) leaves the provider default.
+        ct_kwargs = kwargs.get("chat_template_kwargs") or {}
+        enable_thinking = kwargs.get(
+            "enable_thinking", ct_kwargs.get("enable_thinking")
+        )
+        if enable_thinking is not None and self._provider == "openrouter":
+            payload["reasoning"] = {"enabled": bool(enable_thinking)}
         return payload
 
     async def _post_with_retries(self, path: str, payload: dict) -> httpx.Response:
@@ -519,6 +533,7 @@ class RemoteOpenAIEngine(BaseEngine):
         prompt_t = completion_t = cached_t = 0
         finish: str | None = None
         tool_call_parts: dict[int, dict] = {}
+        in_think = False  # wrapping provider reasoning deltas in <think> tags
 
         self._active_requests += 1
         try:
@@ -544,7 +559,26 @@ class RemoteOpenAIEngine(BaseEngine):
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
                     delta = choice.get("delta") or {}
-                    new_text = delta.get("content") or choice.get("text") or ""
+                    content_text = delta.get("content") or choice.get("text") or ""
+                    reasoning_text = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or ""
+                    )
+                    # Providers stream reasoning in a separate delta field;
+                    # wrap it in <think> tags so oMLX's thinking extraction
+                    # renders it like local reasoning models.
+                    new_text = ""
+                    if reasoning_text:
+                        if not in_think:
+                            new_text += "<think>"
+                            in_think = True
+                        new_text += reasoning_text
+                    if content_text:
+                        if in_think:
+                            new_text += "</think>"
+                            in_think = False
+                        new_text += content_text
                     for tc in delta.get("tool_calls") or []:
                         idx = tc.get("index", 0)
                         part = tool_call_parts.setdefault(
@@ -575,6 +609,10 @@ class RemoteOpenAIEngine(BaseEngine):
                         )
         finally:
             self._active_requests -= 1
+
+        if in_think:
+            # Stream ended inside a reasoning block (e.g. length-capped).
+            accum += "</think>"
 
         yield GenerationOutput(
             text=accum,

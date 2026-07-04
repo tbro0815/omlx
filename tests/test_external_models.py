@@ -233,3 +233,47 @@ class TestRemoteEngine:
         assert outputs[-1].prompt_tokens == 3
         assert outputs[-1].finish_reason == "stop"
         await engine.stop()
+
+    async def test_thinking_toggle_maps_to_openrouter_reasoning(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "4"}}], "usage": {}},
+            )
+
+        engine = _mock_engine(handler)
+        await engine.start()
+        await engine.chat(
+            messages=[{"role": "user", "content": "2+2?"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        assert seen.get("reasoning") == {"enabled": False}
+        await engine.stop()
+
+    async def test_stream_wraps_reasoning_deltas_in_think_tags(self):
+        sse = (
+            'data: {"choices":[{"delta":{"reasoning":"hmm"}}]}\n\n'
+            'data: {"choices":[{"delta":{"reasoning":" more"}}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"Answer"},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=sse.encode(),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        engine = _mock_engine(handler)
+        await engine.start()
+        final = None
+        async for out in engine.stream_chat(
+            messages=[{"role": "user", "content": "hi"}]
+        ):
+            final = out
+        assert final.text == "<think>hmm more</think>Answer"
+        await engine.stop()
