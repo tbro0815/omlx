@@ -403,12 +403,23 @@
                                   x-text="t('bench.upload_skipped.title')"></span>
                         </div>
                         <div class="px-6 py-4 space-y-2">
-                            <p class="text-sm text-amber-600" x-text="t('bench.upload_skipped.reason')"></p>
-                            <ul class="text-sm text-amber-600 list-disc list-inside">
-                                <template x-for="f in (benchUploadSkipped?.features || [])" :key="f">
-                                    <li x-text="t('bench.upload_skipped.features.' + f)"></li>
-                                </template>
-                            </ul>
+                            <template x-if="benchUploadSkipped?.reason === 'external_model'">
+                                <p class="text-sm text-amber-600">
+                                    Community upload is unavailable for cloud/external models:
+                                    these results measure the remote provider's infrastructure
+                                    and network, not this machine's Apple Silicon throughput.
+                                </p>
+                            </template>
+                            <template x-if="benchUploadSkipped?.reason !== 'external_model'">
+                                <div class="space-y-2">
+                                    <p class="text-sm text-amber-600" x-text="t('bench.upload_skipped.reason')"></p>
+                                    <ul class="text-sm text-amber-600 list-disc list-inside">
+                                        <template x-for="f in (benchUploadSkipped?.features || [])" :key="f">
+                                            <li x-text="t('bench.upload_skipped.features.' + f)"></li>
+                                        </template>
+                                    </ul>
+                                </div>
+                            </template>
                         </div>
                     </div>
 

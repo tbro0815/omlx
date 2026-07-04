@@ -2926,7 +2926,7 @@
                             es.close();
                             this.benchEventSource = null;
                         } else if (data.type === 'upload_skipped') {
-                            this.benchUploadSkipped = { features: data.features || [] };
+                            this.benchUploadSkipped = { reason: data.reason || 'experimental_features', features: data.features || [] };
                             this.benchUploading = false;
                             this.benchRunning = false;
                             this.benchProgress = null;

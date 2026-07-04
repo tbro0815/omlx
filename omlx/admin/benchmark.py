@@ -586,6 +586,25 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         parse_chip_info,
     )
 
+    # Community upload is for local Apple-Silicon throughput numbers.
+    # External (remote API) models measure the provider's farm + network,
+    # which would pollute the leaderboard. Note for later: Apple local
+    # hardware models (Foundation Models on-device) may be worth allowing
+    # once that provider lands, even without the full cache pipeline.
+    entry = engine_pool.get_entry(run.request.model_id)
+    if entry is not None and getattr(entry, "source_type", "local") == "external":
+        run.upload_state["phase"] = "skipped"
+        run.upload_state["skipped_reason"] = "external_model"
+        await _send_event(run, {
+            "type": "upload_skipped",
+            "reason": "external_model",
+        })
+        logger.info(
+            f"Benchmark upload skipped: {run.request.model_id} is an "
+            f"external (remote API) model"
+        )
+        return
+
     # Skip upload when experimental features were active during the run.
     # These features skew throughput and would pollute the community
     # leaderboard if mixed in unmarked.
