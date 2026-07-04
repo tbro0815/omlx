@@ -51,16 +51,50 @@ _LOGIN_HINTS = {
 }
 
 
+# Server processes launched by launchd / brew services get a minimal PATH
+# (/usr/bin:/bin:...), so the user's shell finding the CLI doesn't mean we
+# will. Probe the standard install locations too.
+_EXTRA_BIN_DIRS = (
+    "~/.local/bin",
+    "~/.claude/local",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "~/bin",
+    "~/.npm-global/bin",
+    "~/.bun/bin",
+)
+
+
+def _resolve_binary(binary: str) -> str | None:
+    path = shutil.which(binary)
+    if path:
+        return path
+    import os
+
+    for d in _EXTRA_BIN_DIRS:
+        candidate = os.path.join(os.path.expanduser(d), binary)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def cli_available(provider: str) -> tuple[bool, str]:
-    """Check whether the relay CLI for a provider is on PATH."""
+    """Locate the relay CLI for a provider (PATH + standard install dirs).
+
+    Returns (True, absolute path) or (False, user-facing explanation).
+    """
     binary = _CLI_BINARIES.get(provider)
     if binary is None:
         return False, f"Unknown CLI provider {provider!r}"
-    path = shutil.which(binary)
+    path = _resolve_binary(binary)
     if path is None:
+        dirs = ", ".join(_EXTRA_BIN_DIRS)
         return False, (
-            f'The "{binary}" CLI was not found on PATH. Install it and sign '
-            f"in with your subscription, then retry."
+            f'The "{binary}" CLI was not found on the server\'s PATH or in '
+            f"the usual install locations ({dirs}). The server runs with a "
+            f"minimal environment, so a CLI visible in your terminal may "
+            f"still be missed — symlink it into /usr/local/bin or "
+            f"~/.local/bin if it lives somewhere unusual."
         )
     return True, path
 
@@ -162,6 +196,9 @@ class CLIRelayEngine(BaseEngine):
         ok, detail = cli_available(self._provider)
         if not ok:
             raise RuntimeError(detail)
+        # Use the resolved absolute path: the bare name may not be on the
+        # server process's minimal PATH even though the CLI is installed.
+        self._binary = detail
         self._scratch_dir = tempfile.mkdtemp(prefix="omlx-cli-relay-")
         self._loaded = True
         logger.info(

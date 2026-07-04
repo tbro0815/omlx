@@ -1032,3 +1032,33 @@ class TestExternalModelMetadata:
         )
         assert seen["max_tokens"] == 1000
         await engine.stop()
+
+
+class TestCLIResolution:
+    def test_binary_found_in_extra_dir_when_not_on_path(
+        self, tmp_path, monkeypatch
+    ):
+        import omlx.engine.cli_relay as cli_relay
+
+        bindir = tmp_path / "landing"
+        bindir.mkdir()
+        script = bindir / "claude"
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))  # nothing on PATH
+        monkeypatch.setattr(cli_relay, "_EXTRA_BIN_DIRS", (str(bindir),))
+        ok, path = cli_relay.cli_available("claude_cli")
+        assert ok is True
+        assert path == str(script)
+
+    def test_missing_binary_mentions_search_locations(
+        self, tmp_path, monkeypatch
+    ):
+        import omlx.engine.cli_relay as cli_relay
+
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setattr(cli_relay, "_EXTRA_BIN_DIRS", ("/nonexistent-dir",))
+        ok, detail = cli_relay.cli_available("codex_cli")
+        assert ok is False
+        assert "codex" in detail and "/nonexistent-dir" in detail
