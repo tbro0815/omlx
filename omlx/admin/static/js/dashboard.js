@@ -4195,8 +4195,13 @@
             },
 
             extEffectiveBaseUrl() {
-                if (this.extProvider === 'openrouter') {
-                    return this.extBaseUrl || 'https://openrouter.ai/api/v1';
+                const presets = {
+                    openrouter: 'https://openrouter.ai/api/v1',
+                    anthropic: 'https://api.anthropic.com/v1',
+                    openai: 'https://api.openai.com/v1',
+                };
+                if (presets[this.extProvider]) {
+                    return this.extBaseUrl || presets[this.extProvider];
                 }
                 return this.extBaseUrl;
             },

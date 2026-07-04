@@ -26,12 +26,22 @@
             <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
                 <div class="min-w-0 flex-1 flex items-center gap-2">
                     <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded uppercase tracking-wide"
-                          :class="model.provider === 'openrouter'
-                              ? 'bg-indigo-50 text-indigo-600 border border-indigo-200'
-                              : (model.provider === 'apple_fm'
-                                  ? 'bg-neutral-100 text-neutral-700 border border-neutral-300'
-                                  : 'bg-teal-50 text-teal-600 border border-teal-200')"
-                          x-text="model.provider === 'openrouter' ? 'OpenRouter' : (model.provider === 'apple_fm' ? 'Apple FM' : 'OpenAI-compat')"></span>
+                          :class="{
+                              'openrouter': 'bg-indigo-50 text-indigo-600 border border-indigo-200',
+                              'apple_fm': 'bg-neutral-100 text-neutral-700 border border-neutral-300',
+                              'anthropic': 'bg-orange-50 text-orange-600 border border-orange-200',
+                              'openai': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+                              'claude_cli': 'bg-orange-50 text-orange-600 border border-orange-200',
+                              'codex_cli': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+                          }[model.provider] || 'bg-teal-50 text-teal-600 border border-teal-200'"
+                          x-text="{
+                              'openrouter': 'OpenRouter',
+                              'apple_fm': 'Apple FM',
+                              'anthropic': 'Anthropic',
+                              'openai': 'OpenAI',
+                              'claude_cli': 'Claude subscr.',
+                              'codex_cli': 'Codex subscr.',
+                          }[model.provider] || 'OpenAI-compat'"></span>
                     <span class="text-sm font-medium text-neutral-900 truncate"
                           :title="model.remote_model"
                           x-text="model.display_name || model.remote_model"></span>
@@ -40,7 +50,7 @@
                         <span class="text-xs text-neutral-400 flex-shrink-0"
                               x-text="'(' + Math.round(model.context_length / 1024) + 'k ctx)'"></span>
                     </template>
-                    <template x-if="!model.has_api_key && model.provider !== 'apple_fm'">
+                    <template x-if="!model.has_api_key && !['apple_fm', 'claude_cli', 'codex_cli'].includes(model.provider)">
                         <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">no key</span>
                     </template>
                     <template x-if="model.loaded">
@@ -107,6 +117,34 @@
                             class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
                         Apple FM
                     </button>
+                    <button @click="extProvider = 'anthropic'; extCatalog = []; extError = ''; extRemoteModel = ''"
+                            :class="extProvider === 'anthropic'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Anthropic
+                    </button>
+                    <button @click="extProvider = 'openai'; extCatalog = []; extError = ''; extRemoteModel = ''"
+                            :class="extProvider === 'openai'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        OpenAI
+                    </button>
+                    <button @click="extProvider = 'claude_cli'; extCatalog = []; extError = ''; extRemoteModel = 'default'"
+                            :class="extProvider === 'claude_cli'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Claude&nbsp;<span class="text-[10px] opacity-70">subscr.</span>
+                    </button>
+                    <button @click="extProvider = 'codex_cli'; extCatalog = []; extError = ''; extRemoteModel = 'default'"
+                            :class="extProvider === 'codex_cli'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Codex&nbsp;<span class="text-[10px] opacity-70">subscr.</span>
+                    </button>
                 </div>
             </div>
             <!-- Base URL -->
@@ -130,8 +168,29 @@
                     developer-accessible through Apple's SDK (yet).
                 </p>
             </div>
+            <div x-show="extProvider === 'anthropic'">
+                <p class="text-[11px] text-neutral-400">
+                    Endpoint: https://api.anthropic.com/v1 (OpenAI-compatible layer).
+                    Uses a Claude API key from platform.claude.com.
+                </p>
+            </div>
+            <div x-show="extProvider === 'openai'">
+                <p class="text-[11px] text-neutral-400">
+                    Endpoint: https://api.openai.com/v1. Uses an OpenAI API key.
+                </p>
+            </div>
+            <div x-show="extProvider === 'claude_cli' || extProvider === 'codex_cli'">
+                <p class="text-[11px] text-neutral-400">
+                    Relays through the locally installed
+                    <span class="font-mono" x-text="extProvider === 'claude_cli' ? 'claude' : 'codex'"></span>
+                    CLI using your subscription sign-in. No API key — oMLX never
+                    sees or stores auth tokens; sign in once via the CLI itself.
+                    Requests run one at a time and sampling settings are managed
+                    by the CLI.
+                </p>
+            </div>
             <!-- API key -->
-            <div x-show="extProvider !== 'apple_fm'">
+            <div x-show="!['apple_fm', 'claude_cli', 'codex_cli'].includes(extProvider)">
                 <label class="block text-xs font-medium text-neutral-500 mb-1.5">API key</label>
                 <input type="password" x-model="extApiKey" placeholder="sk-…  (stored locally, 0600)"
                        autocomplete="off"
