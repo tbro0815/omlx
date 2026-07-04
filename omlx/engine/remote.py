@@ -45,17 +45,41 @@ class _ApproxTokenizer:
     Local token counting is impossible without the provider's tokenizer;
     ~4 chars/token is the conventional estimate. Real counts come from the
     API's ``usage`` block and override these estimates in outputs.
+
+    encode() returns ids that index an internal chunk table, so the
+    ``encode -> slice -> decode`` pattern — used by the throughput
+    benchmark's prompt synthesizer (admin/benchmark.py::_generate_prompt)
+    — reconstructs the corresponding text instead of returning "". Without
+    this, remote benchmark runs send empty prompts (OpenRouter answers
+    'Input required: specify "prompt"').
     """
 
     eos_token_id = None
+    _CHUNK = 4
+    _MAX_CHUNKS = 1_000_000  # ~4 MB of text before the table resets
 
-    @staticmethod
-    def encode(text: str, **_kwargs) -> list[int]:
-        return list(range(max(1, len(text) // 4)))
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
 
-    @staticmethod
-    def decode(_ids, **_kwargs) -> str:
-        return ""
+    def encode(self, text: str, **_kwargs) -> list[int]:
+        if len(self._chunks) > self._MAX_CHUNKS:
+            self._chunks = []
+        base = len(self._chunks)
+        pieces = [
+            text[i : i + self._CHUNK] for i in range(0, len(text), self._CHUNK)
+        ] or [""]
+        self._chunks.extend(pieces)
+        return list(range(base, base + len(pieces)))
+
+    def decode(self, ids, **_kwargs) -> str:
+        out = []
+        for i in ids:
+            i = int(i)
+            if 0 <= i < len(self._chunks):
+                out.append(self._chunks[i])
+            else:
+                out.append(" lorem")  # unknown id: harmless filler
+        return "".join(out)
 
 
 class RemoteOpenAIEngine(BaseEngine):
