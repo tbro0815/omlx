@@ -678,7 +678,12 @@ print(json.dumps({
 
 class TestCLIRelay:
     def test_cli_available_reports_missing_binary(self, monkeypatch, tmp_path):
+        import omlx.engine.cli_relay as cli_relay
+
         monkeypatch.setenv("PATH", str(tmp_path))  # empty dir: nothing on PATH
+        # the real machine may have the CLI in a standard install dir;
+        # neutralize the fallback so "missing" is actually missing
+        monkeypatch.setattr(cli_relay, "_EXTRA_BIN_DIRS", ())
         ok, detail = cli_available("claude_cli")
         assert ok is False and "claude" in detail
 
