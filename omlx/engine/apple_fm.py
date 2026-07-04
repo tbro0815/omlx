@@ -51,6 +51,12 @@ class AppleFMEngine(BaseEngine):
     # blind). Same mechanism DFlash uses for its VLM fallback.
     supports_multimodal_fallback = True
 
+    # Inference runs on this machine's Neural Engine / GPU via the local
+    # SDK bridge — no network hop. Benchmarks may treat per-token timing
+    # as measured (unlike HTTP engines, whose tokens arrive in network
+    # bursts), and results represent this device's real throughput.
+    local_inference = True
+
     def __init__(
         self,
         model_name: str,

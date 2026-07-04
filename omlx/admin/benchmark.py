@@ -367,7 +367,11 @@ async def _run_single_test(
     # per-token timing is meaningless (observed tg TPS in the millions).
     # Report generation-side metrics as unmeasured; TTFT, E2E latency and
     # total throughput remain honest end-to-end network numbers.
-    if getattr(engine, "model_type", None) == "remote":
+    # Exception: engines flagged local_inference (Apple FM on-device) run
+    # on this machine — their per-token timing is real.
+    if getattr(engine, "model_type", None) == "remote" and not getattr(
+        engine, "local_inference", False
+    ):
         generation_duration_s = None
         generation_measured = False
     else:
@@ -600,7 +604,23 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     # hardware models (Foundation Models on-device) may be worth allowing
     # once that provider lands, even without the full cache pipeline.
     entry = engine_pool.get_entry(run.request.model_id)
-    if entry is not None and getattr(entry, "source_type", "local") == "external":
+    is_external = (
+        entry is not None and getattr(entry, "source_type", "local") == "external"
+    )
+    apple_fm_record = None
+    if is_external:
+        registry = getattr(engine_pool, "_external_registry", None)
+        record = registry.get(run.request.model_id) if registry else None
+        if (
+            record is not None
+            and record.provider == "apple_fm"
+            and record.remote_model in ("on-device", "default")
+        ):
+            # Apple FM on-device runs on this machine's silicon: the
+            # numbers characterize the device, exactly what the community
+            # leaderboard compares. Cloud/PCC variants stay excluded.
+            apple_fm_record = record
+    if is_external and apple_fm_record is None:
         run.upload_state["phase"] = "skipped"
         run.upload_state["skipped_reason"] = "external_model"
         await _send_event(run, {
@@ -660,8 +680,14 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     # Get model info
     entry = engine_pool.get_entry(run.request.model_id)
     model_path = entry.model_path if entry else ""
-    quantization = _detect_quantization(model_path)
-    model_name = _clean_model_name(run.request.model_id, quantization)
+    if apple_fm_record is not None:
+        # Canonical name so submissions group across devices; Apple ships
+        # the weights pre-quantized as part of the OS ("system").
+        model_name = "Apple-Foundation-Model-3-on-device"
+        quantization = "system"
+    else:
+        quantization = _detect_quantization(model_path)
+        model_name = _clean_model_name(run.request.model_id, quantization)
 
     # Generate submission group
     submission_group = str(uuid.uuid4())
