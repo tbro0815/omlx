@@ -373,15 +373,15 @@ class AppleFMEngine(BaseEngine):
         """Return (finish_reason, message) for SDK exceptions."""
         fm = self._fm
         name = type(e).__name__
-        if name in ("ImagePromptError", "PromptError") and "macOS 27" in str(e):
+        if name in ("ImagePromptError", "PromptError") and (
+            "macOS 27" in str(e) or "does not support attachment" in str(e)
+        ):
             return "error", (
-                "On-device vision is unavailable: the installed apple-fm-sdk "
-                "was compiled without the macOS 27 SDK (image attachments "
-                "need it). Text generation is unaffected. To enable vision: "
-                "install an Xcode version that ships the macOS 27 SDK, then "
-                "reinstall the SDK from source: \"$(brew --prefix omlx)"
-                "/libexec/bin/pip\" install --force-reinstall --no-binary "
-                ":all: apple-fm-sdk"
+                "On-device vision is unavailable on this system: image "
+                "attachments in Apple's Foundation Models framework require "
+                "macOS 27 at runtime (and an SDK build compiled with the "
+                "macOS 27 SDK). Text generation is unaffected. "
+                f"[{name}: {e}]"
             )
         if fm is not None:
             if isinstance(e, getattr(fm, "GuardrailViolationError", ())) or (
