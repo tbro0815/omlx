@@ -889,9 +889,66 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 
+# Bundle formats that jang-tools can actually load.
+#
+# jang-tools' load_jang_model / load_jang_vlm_model require a recognised
+# ``format`` (they raise "jang_config.json is missing 'format' field. Expected
+# one of: jang, jjqf, mxq" for anything else), while load_jangtq_model handles
+# the TurboQuant path keyed on weight_format == "mxtq" / a JANGTQ profile.
+JANG_LOADABLE_FORMATS: frozenset[str] = frozenset({"jang", "jjqf", "mxq"})
+JANG_TURBOQUANT_WEIGHT_FORMATS: frozenset[str] = frozenset({"mxtq"})
+
+
+def _read_jang_config(model_path: Path) -> dict | None:
+    """Return the first parseable JANG config dict in model_path, else None."""
+    for cfg_name in JANG_CONFIG_FILES:
+        cfg_path = model_path / cfg_name
+        if not cfg_path.exists():
+            continue
+        try:
+            with open(cfg_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError, OSError):
+            return None
+    return None
+
+
+def _jang_config_is_loadable(cfg: dict) -> bool:
+    """True when a JANG config describes a bundle the JANG loader can handle.
+
+    jang-tools can only load genuine JANG bundles: the standard path needs a
+    ``format`` of jang / jjqf / mxq, and the TurboQuant path needs
+    ``weight_format == "mxtq"`` (or a JANGTQ ``profile``).  A standard MLX model
+    that merely ships a *metadata* ``jang_config.json`` — e.g. an mxfp8 bundle
+    quantised with ``mx.quantize`` — declares none of these, so it must load
+    through the normal mlx-lm / mlx-vlm engine instead of the JANG loader.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    fmt = str(cfg.get("format", "")).strip().lower()
+    if fmt in JANG_LOADABLE_FORMATS:
+        return True
+    weight_format = str(cfg.get("weight_format", "")).strip().lower()
+    if weight_format in JANG_LOADABLE_FORMATS or weight_format in JANG_TURBOQUANT_WEIGHT_FORMATS:
+        return True
+    if "JANGTQ" in str(cfg.get("profile", "")).upper():
+        return True
+    return False
+
+
 def _is_jang_model(model_path: Path) -> bool:
-    """Check if directory contains a JANG model config file."""
-    return any((model_path / f).exists() for f in JANG_CONFIG_FILES)
+    """Return True only when the directory holds a JANG bundle jang-tools can load.
+
+    Stricter than "a jang_config.json exists": some standard MLX models ship a
+    metadata jang_config.json (mxfp8 / mx.quantize) that the JANG loader cannot
+    parse.  Routing those to the JANG loader makes them fail with
+    "jang_config.json is missing 'format' field"; they must fall through to the
+    normal engine (mlx-lm / mlx-vlm) instead.
+    """
+    cfg = _read_jang_config(model_path)
+    if cfg is None:
+        return False
+    return _jang_config_is_loadable(cfg)
 
 
 # Model types for which a JANG config should win the engine routing.

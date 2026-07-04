@@ -56,43 +56,43 @@ class TestResolveJangEngineType:
 
     def test_returns_jang_for_llm_jang_dir(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "llm") == "jang"
 
     def test_returns_jang_for_vlm_jang_dir(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "vlm") == "jang"
 
     def test_returns_none_for_audio_stt(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "audio_stt") is None
 
     def test_returns_none_for_embedding(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "embedding") is None
 
     def test_returns_none_for_reranker(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "reranker") is None
 
     def test_returns_none_for_none_model_type(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, None) is None
 
     def test_returns_none_for_empty_model_type(self, tmp_path):
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         assert resolve_jang_engine_type(tmp_path, "") is None
 
@@ -113,7 +113,7 @@ class TestResolveJangEngineType:
             # Use a fresh tmp subdir for each filename
             sub = tmp_path / f"sub_{cfg}"
             sub.mkdir()
-            (sub / cfg).write_text(json.dumps({}))
+            (sub / cfg).write_text(json.dumps({"format": "jang"}))
             assert resolve_jang_engine_type(sub, "llm") == "jang", f"failed for {cfg}"
             assert resolve_jang_engine_type(sub, "embedding") is None, (
                 f"must not route embedding to jang for {cfg}"
@@ -150,12 +150,12 @@ class TestEngineTypeClobberGuards:
             entry.engine_type = resolve_jang_engine_type(...) or ...
         and both routes.py branches.
         """
-        (tmp_path / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (tmp_path / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         assert resolve_jang_engine_type(tmp_path, "llm") == "jang"
 
     def test_vlm_preserves_jang(self, tmp_path):
         """model_type='vlm' on a jang dir → helper returns 'jang'."""
-        (tmp_path / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (tmp_path / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         assert resolve_jang_engine_type(tmp_path, "vlm") == "jang"
 
     def test_embedding_does_not_force_jang(self, tmp_path):
@@ -167,7 +167,7 @@ class TestEngineTypeClobberGuards:
         Sabotage: remove `model_type in JANG_ENGINE_MODEL_TYPES` → returns 'jang'
         → this assertion fails.
         """
-        (tmp_path / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (tmp_path / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         result = resolve_jang_engine_type(tmp_path, "embedding")
         assert result is None
         # Confirm the `or` fallback produces the right engine
@@ -176,7 +176,7 @@ class TestEngineTypeClobberGuards:
 
     def test_audio_stt_does_not_force_jang(self, tmp_path):
         """model_type='audio_stt' with jang_config.json → helper returns None."""
-        (tmp_path / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (tmp_path / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         assert resolve_jang_engine_type(tmp_path, "audio_stt") is None
 
     def test_non_jang_dir_returns_none_for_llm(self, tmp_path):
@@ -211,7 +211,7 @@ class TestModelDiscoveryEngineTypeOrdering:
         """
         model_dir = tmp_path / "jang-audio-model"
         model_dir.mkdir()
-        (model_dir / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (model_dir / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         (model_dir / "config.json").write_text(json.dumps({"model_type": "whisper"}))
         (model_dir / "model.safetensors").write_bytes(b"0" * 100)
 
@@ -230,7 +230,7 @@ class TestModelDiscoveryEngineTypeOrdering:
         """
         model_dir = tmp_path / "jang-llm"
         model_dir.mkdir()
-        (model_dir / "jang_config.json").write_text(json.dumps({"format_version": "2.0"}))
+        (model_dir / "jang_config.json").write_text(json.dumps({"format": "jang", "format_version": "2.0"}))
         (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_moe"}))
         (model_dir / "model.safetensors").write_bytes(b"0" * 100)
 
@@ -249,6 +249,7 @@ class TestModelDiscoveryEngineTypeOrdering:
         model_dir = tmp_path / "jang-vlm"
         model_dir.mkdir()
         (model_dir / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
             "format_version": "2.0",
             "architecture": {"has_vision": True},
         }))
@@ -509,7 +510,7 @@ class TestJangDflashRoutingF4:
         from omlx.model_discovery import resolve_jang_engine_type
 
         (tmp_path / "jang_config.json").write_text(
-            json.dumps({"format_version": "2.0"})
+            json.dumps({"format": "jang", "format_version": "2.0"})
         )
         # dflash settings have no bearing on resolve_jang_engine_type — it only
         # looks at the model directory and model_type.
@@ -562,3 +563,83 @@ class TestJangDflashRoutingF4:
                 f"DFlash SHOULD run for effective_type={effective_type!r}, "
                 f"dflash_enabled={dflash_enabled}, dflash_draft={dflash_draft!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Regression: metadata-only jang_config.json must NOT force the JANG loader
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataOnlyJangConfigNotRoutedToJang:
+    """
+    A standard MLX model may ship a *metadata* ``jang_config.json`` that the
+    JANG loader (jang-tools) cannot actually load.  jang-tools loads only real
+    JANG bundles: the standard path needs ``format`` ∈ {jang, jjqf, mxq} and the
+    TurboQuant path needs ``weight_format == "mxtq"`` (or a JANGTQ ``profile``).
+
+    Regression for OsaurusAI/Ornith-1.0-35B-MXFP8: an mxfp8 / ``mx.quantize``
+    VLM whose jang_config.json carries only descriptive metadata (no ``format``,
+    ``weight_format == "mxfp8"``).  Routing it to the JANG loader made it fail
+    with "JANG config jang_config.json is missing 'format' field. Expected one
+    of: jang, jjqf, mxq".  It must fall through to the normal (vlm/batched)
+    engine, exactly like the equivalent model with no jang_config.json at all.
+
+    Sabotage: revert ``_is_jang_model`` to a presence-only check
+    (``any((path / f).exists() ...)``) → these dirs route to 'jang' → asserts fail.
+    """
+
+    ORNITH_JANG_CONFIG = {
+        "version": 2,
+        "weight_format": "mxfp8",
+        "profile": "MXFP8",
+        "has_vision": True,
+        "quantization": {
+            "method": "mxfp8",
+            "quantization_backend": "mx.quantize",
+            "mode": "mxfp8",
+            "bits": 8,
+            "group_size": 32,
+        },
+    }
+
+    def test_mxfp8_metadata_config_is_not_routed_to_jang(self, tmp_path):
+        """mxfp8 metadata jang_config (no recognised format) → helper None."""
+        (tmp_path / "jang_config.json").write_text(json.dumps(self.ORNITH_JANG_CONFIG))
+        assert resolve_jang_engine_type(tmp_path, "llm") is None
+        assert resolve_jang_engine_type(tmp_path, "vlm") is None
+
+    def test_mxfp8_vlm_discovers_as_vlm_engine_not_jang(self, tmp_path):
+        """
+        Full discovery of an Ornith-like directory (jang metadata + a vision
+        config.json) must pick engine_type='vlm', matching the equivalent model
+        that ships no jang_config.json.
+        """
+        model_dir = tmp_path / "Ornith-1.0-35B-MXFP8"
+        model_dir.mkdir()
+        (model_dir / "jang_config.json").write_text(json.dumps(self.ORNITH_JANG_CONFIG))
+        (model_dir / "config.json").write_text(json.dumps({
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "vision_config": {"model_type": "qwen3_5_moe_vision"},
+        }))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 100)
+
+        models = discover_models(tmp_path)
+        assert models["Ornith-1.0-35B-MXFP8"].engine_type == "vlm"
+
+    def test_real_jangtq_config_still_routes_to_jang(self, tmp_path):
+        """A genuine JANGTQ bundle (weight_format 'mxtq') must still route to jang."""
+        (tmp_path / "jang_config.json").write_text(json.dumps({
+            "version": 2,
+            "weight_format": "mxtq",
+            "profile": "JANGTQ_K",
+        }))
+        assert resolve_jang_engine_type(tmp_path, "llm") == "jang"
+
+    def test_real_jang_format_config_still_routes_to_jang(self, tmp_path):
+        """A genuine JANG bundle (format 'jang') must still route to jang."""
+        (tmp_path / "jang_config.json").write_text(json.dumps({
+            "format": "jang",
+            "format_version": "2.0",
+        }))
+        assert resolve_jang_engine_type(tmp_path, "vlm") == "jang"
