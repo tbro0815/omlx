@@ -402,6 +402,14 @@ class EnginePool:
                 model_name=model_id,
                 variant=record.remote_model,
             )
+        if record.provider in ("claude_cli", "codex_cli"):
+            from .engine.cli_relay import CLIRelayEngine
+
+            return CLIRelayEngine(
+                model_name=model_id,
+                provider=record.provider,
+                remote_model=record.remote_model,
+            )
         return RemoteOpenAIEngine(
             model_name=model_id,
             base_url=record.base_url,

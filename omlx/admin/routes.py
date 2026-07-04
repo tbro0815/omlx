@@ -6507,9 +6507,37 @@ async def external_model_catalog(
             "base_url": "applefm://local",
         }
 
+    if provider in ("claude_cli", "codex_cli"):
+        # Subscription relay: report CLI availability + a static model
+        # list (the CLIs accept model aliases, not a queryable catalog).
+        from ..engine.cli_relay import cli_available
+
+        ok, detail = cli_available(provider)
+        if not ok:
+            raise HTTPException(status_code=502, detail=detail)
+        if provider == "claude_cli":
+            models = [
+                {"id": "default", "name": "Subscription default model"},
+                {"id": "opus", "name": "Claude Opus (current)"},
+                {"id": "sonnet", "name": "Claude Sonnet (current)"},
+                {"id": "haiku", "name": "Claude Haiku (current)"},
+            ]
+        else:
+            models = [
+                {"id": "default", "name": "Subscription default model"},
+                {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
+                {"id": "gpt-5.2", "name": "GPT-5.2"},
+            ]
+        for m in models:
+            m.setdefault("context_length", None)
+            m.setdefault("modality", "text")
+        return {"models": models, "base_url": f"cli://{provider.removesuffix('_cli')}"}
+
+    from ..external_models import PRESET_BASE_URLS
+
     base_url = (body.get("base_url") or "").strip()
-    if provider == "openrouter" and not base_url:
-        base_url = OPENROUTER_BASE_URL
+    if not base_url:
+        base_url = PRESET_BASE_URLS.get(provider, "")
     base_url = base_url.rstrip("/")
 
     try:
@@ -6523,6 +6551,10 @@ async def external_model_catalog(
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "anthropic":
+            # Anthropic's native /v1/models wants x-api-key.
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
 
     try:
         async with _httpx.AsyncClient(timeout=20.0) as client:
@@ -6552,7 +6584,7 @@ async def external_model_catalog(
         models.append(
             {
                 "id": item["id"],
-                "name": item.get("name") or item["id"],
+                "name": item.get("name") or item.get("display_name") or item["id"],
                 "context_length": ctx,
                 "modality": modality,
             }
