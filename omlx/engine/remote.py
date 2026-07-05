@@ -482,6 +482,74 @@ class RemoteOpenAIEngine(BaseEngine):
 
     # ── chat (native passthrough) ─────────────────────────────────────
 
+    @classmethod
+    def _parse_completion_body(cls, resp: httpx.Response) -> Dict[str, Any]:
+        """Parse a chat-completions response, tolerating SSE bodies.
+
+        Some OpenAI-compatible servers (e.g. Apple's ``fm serve``) stream
+        SSE chunks even when the request did not ask for streaming.
+        """
+        content_type = (resp.headers.get("content-type") or "").lower()
+        if "text/event-stream" not in content_type:
+            try:
+                return resp.json()
+            except ValueError:
+                if not resp.text.lstrip().startswith("data:"):
+                    raise
+        return cls._aggregate_sse_body(resp.text)
+
+    @staticmethod
+    def _aggregate_sse_body(raw: str) -> Dict[str, Any]:
+        """Reassemble a non-streaming completion body from SSE chunks."""
+        content: List[str] = []
+        reasoning: List[str] = []
+        tool_calls: List[dict] = []
+        finish_reason: Optional[str] = None
+        usage: Optional[dict] = None
+        for line in raw.splitlines():
+            data = line.strip()
+            if not data.startswith("data:"):
+                continue
+            data = data[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            usage = chunk.get("usage") or usage
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or choice.get("message") or {}
+            if delta.get("content"):
+                content.append(delta["content"])
+            step = delta.get("reasoning") or delta.get("reasoning_content")
+            if step:
+                reasoning.append(step)
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", len(tool_calls))
+                while len(tool_calls) <= idx:
+                    tool_calls.append(
+                        {"type": "function", "function": {"name": "", "arguments": ""}}
+                    )
+                slot = tool_calls[idx]
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+            finish_reason = choice.get("finish_reason") or finish_reason
+        message: Dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+        if reasoning:
+            message["reasoning"] = "".join(reasoning)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return {
+            "choices": [{"message": message, "finish_reason": finish_reason or "stop"}],
+            "usage": usage,
+        }
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -506,7 +574,7 @@ class RemoteOpenAIEngine(BaseEngine):
         self._active_requests += 1
         try:
             resp = await self._post_with_retries("/chat/completions", payload)
-            body = resp.json()
+            body = self._parse_completion_body(resp)
         finally:
             self._active_requests -= 1
 

@@ -971,6 +971,76 @@ class TestAnthropicSamplingQuirks:
         await engine.stop()
 
 
+class TestAlwaysStreamingEndpointQuirks:
+    """Servers like Apple's `fm serve` stream SSE even for stream=false."""
+
+    SSE_BODY = (
+        'data: {"id":"c1","choices":[{"delta":{"role":"assistant"}}],"model":"pcc"}\n\n'
+        'data: {"id":"c1","choices":[{"delta":{"content":"PCC"}}],"model":"pcc"}\n\n'
+        'data: {"id":"c1","choices":[{"delta":{"content":" works"}}],"model":"pcc"}\n\n'
+        'data: {"id":"c1","choices":[{"finish_reason":"stop","delta":{}}],'
+        '"usage":{"prompt_tokens":5,"completion_tokens":2},"model":"pcc"}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def _sse_engine(self, body: str, content_type: str) -> RemoteOpenAIEngine:
+        engine = RemoteOpenAIEngine(
+            model_name="ext.oai.pcc",
+            base_url="http://127.0.0.1:8181/v1",
+            remote_model="pcc",
+            api_key=None,
+            provider="openai_compatible",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=body, headers={"content-type": content_type}
+            )
+
+        async def _start():
+            engine._client = httpx.AsyncClient(
+                base_url="http://127.0.0.1:8181/v1",
+                transport=httpx.MockTransport(handler),
+            )
+            engine._loaded = True
+
+        engine.start = _start
+        return engine
+
+    async def test_chat_aggregates_sse_response(self):
+        engine = self._sse_engine(self.SSE_BODY, "text/event-stream")
+        await engine.start()
+        out = await engine.chat(messages=[{"role": "user", "content": "hi"}])
+        assert out.text == "PCC works"
+        assert out.finish_reason == "stop"
+        assert out.prompt_tokens == 5
+        assert out.completion_tokens == 2
+        await engine.stop()
+
+    async def test_chat_aggregates_sse_despite_json_content_type(self):
+        engine = self._sse_engine(self.SSE_BODY, "application/json")
+        await engine.start()
+        out = await engine.chat(messages=[{"role": "user", "content": "hi"}])
+        assert out.text == "PCC works"
+        await engine.stop()
+
+    def test_aggregate_merges_streamed_tool_calls(self):
+        raw = (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1",'
+            '"function":{"name":"get_weather","arguments":"{\\"ci"}}]}}]}\n\n'
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"arguments":"ty\\":\\"Rome\\"}"}}]}}]}\n\n'
+            'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        body = RemoteOpenAIEngine._aggregate_sse_body(raw)
+        call = body["choices"][0]["message"]["tool_calls"][0]
+        assert call["id"] == "t1"
+        assert call["function"]["name"] == "get_weather"
+        assert call["function"]["arguments"] == '{"city":"Rome"}'
+        assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+
 class TestExternalModelMetadata:
     def test_anthropic_defaults_fill_ctx_output_and_vision(self, tmp_path):
         reg = ExternalModelRegistry(tmp_path)
