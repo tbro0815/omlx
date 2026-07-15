@@ -30,6 +30,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.jang import JANGLoader
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
@@ -66,6 +67,8 @@ class EngineEntry:
         "embedding",
         "reranker",
         "vlm",
+        "jang",
+        "remote",
         "audio_stt",
         "audio_tts",
         "audio_sts",
@@ -343,6 +346,84 @@ class EnginePool:
                 if isinstance(engine, EmbeddingEngine):
                     engine._batch_size = batch_size
 
+    def attach_external_registry(self, registry) -> None:
+        """Attach an ExternalModelRegistry and inject its models as entries."""
+        self._external_registry = registry
+        self._inject_external_entries()
+
+    def _inject_external_entries(self) -> None:
+        """(Re-)create EngineEntry records for registered external models.
+
+        External models have no local directory: estimated_size is 0 (they
+        occupy no local memory, so the memory-ceiling admission ignores
+        them) and engine_type "remote" routes them to RemoteOpenAIEngine.
+        Loaded entries are left untouched.
+        """
+        registry = getattr(self, "_external_registry", None)
+        if registry is None:
+            return
+        registered_ids = set()
+        for m in registry.list():
+            registered_ids.add(m.model_id)
+            existing = self._entries.get(m.model_id)
+            if existing is not None:
+                continue  # keep loaded/idle entry as-is
+            self._entries[m.model_id] = EngineEntry(
+                model_id=m.model_id,
+                model_path=f"{m.base_url}#{m.remote_model}",
+                model_type=(
+                    "vlm" if (m.modality or "").find("image") >= 0 else "llm"
+                ),
+                engine_type="remote",
+                estimated_size=0,
+                model_context_length=m.context_length,
+                source_type="external",
+                source_repo_id=m.remote_model,
+            )
+            logger.info(f"Injected external model entry: {m.model_id}")
+        # Drop external entries whose registry record was removed (only when
+        # not loaded; a loaded one is dropped on its next unload + rescan).
+        for mid in [
+            mid
+            for mid, e in self._entries.items()
+            if e.source_type == "external"
+            and mid not in registered_ids
+            and e.engine is None
+        ]:
+            del self._entries[mid]
+
+    def _build_remote_engine(self, model_id: str):
+        """Construct the engine for an external registry record."""
+        from .engine.remote import RemoteOpenAIEngine
+
+        registry = getattr(self, "_external_registry", None)
+        record = registry.get(model_id) if registry is not None else None
+        if record is None:
+            raise ModelNotFoundError(model_id)
+        if record.provider == "apple_fm":
+            from .engine.apple_fm import AppleFMEngine
+
+            return AppleFMEngine(
+                model_name=model_id,
+                variant=record.remote_model,
+            )
+        if record.provider in ("claude_cli", "codex_cli"):
+            from .engine.cli_relay import CLIRelayEngine
+
+            return CLIRelayEngine(
+                model_name=model_id,
+                provider=record.provider,
+                remote_model=record.remote_model,
+            )
+        return RemoteOpenAIEngine(
+            model_name=model_id,
+            base_url=record.base_url,
+            remote_model=record.remote_model,
+            api_key=registry.get_api_key(record.base_url),
+            provider=record.provider,
+            max_output_tokens=getattr(record, "max_output_tokens", None),
+        )
+
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
     ) -> None:
@@ -397,15 +478,22 @@ class EnginePool:
             if model_id in pinned_set:
                 logger.info(f"Pinned model: {model_id}")
 
-        # Remove entries no longer discovered and not loaded
+        # Remove entries no longer discovered and not loaded.
+        # External (remote API) entries have no backing directory and are
+        # managed by the ExternalModelRegistry, not the scanner — exempt.
         discovered_ids = set(discovered.keys())
         stale = [
             mid
             for mid in self._entries
-            if mid not in discovered_ids and self._entries[mid].engine is None
+            if mid not in discovered_ids
+            and self._entries[mid].engine is None
+            and self._entries[mid].source_type != "external"
         ]
         for mid in stale:
             del self._entries[mid]
+
+        # (Re-)inject external models after every rescan.
+        self._inject_external_entries()
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())
@@ -438,9 +526,18 @@ class EnginePool:
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
                 entry.model_type = settings.model_type_override
-                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
-                    settings.model_type_override, "batched"
-                )
+                # JANG models must keep the jang engine even with a persisted
+                # model_type override — _MODEL_TYPE_TO_ENGINE has no 'jang' key,
+                # so deriving from it clobbers jang -> batched and the turboquant
+                # (tq_*) tensors fail to load ("Received N parameters not in model").
+                # resolve_jang_engine_type handles the "llm/vlm only" guard so that
+                # an embedding/audio model with a stray jang_config.json is not
+                # mis-routed to the jang engine.
+                from pathlib import Path as _Path
+                from .model_discovery import resolve_jang_engine_type as _resolve_jang
+                entry.engine_type = _resolve_jang(
+                    _Path(entry.model_path), settings.model_type_override
+                ) or self._MODEL_TYPE_TO_ENGINE.get(settings.model_type_override, "batched")
                 logger.info(
                     f"Applied model_type override for {model_id}: "
                     f"type={entry.model_type}, engine={entry.engine_type}"
@@ -1289,10 +1386,12 @@ class EnginePool:
 
         When a load raises partway through (e.g. weights loaded, processor
         construction failed), the weights are often reachable only via the
-        propagating exception's traceback frames. Spawn a background task
-        that waits briefly for the exception to be handled and dropped, then
-        runs gc + synchronize + clear_cache rounds until the live memory
-        reading returns near its pre-load level (or rounds are exhausted).
+        propagating exception's traceback frames. Running gc/clear_cache
+        synchronously here would be useless — the exception is still alive in
+        the caller. Instead, spawn a background task that waits briefly for
+        the exception to be handled and dropped, then runs
+        gc + synchronize + clear_cache rounds until the live memory reading
+        returns near its pre-load level (or rounds are exhausted).
         """
 
         async def _reclaim() -> None:
@@ -1326,7 +1425,8 @@ class EnginePool:
             self._wake_process_memory_enforcer()
 
         # Keep a reference so the task isn't garbage-collected mid-flight;
-        # one slot suffices -- a newer failure supersedes the previous task.
+        # one slot suffices — a newer failure supersedes the previous task's
+        # usefulness (both poll the same global gauges).
         self._failed_load_reclaim_task = asyncio.get_running_loop().create_task(
             _reclaim()
         )
@@ -1363,6 +1463,13 @@ class EnginePool:
             if force_lm and effective_type == "vlm":
                 effective_type = "batched"
                 logger.info(f"Loading model as LM (force_lm=True): {model_id}")
+            # NOTE: force_lm does NOT downgrade JANG VLMs.  JANG models with
+            # engine_type="jang" stay on the JANGLoader path regardless of
+            # force_lm; JANGLoader internally picks the VLM or LLM loader via
+            # _should_use_vlm_loader().  Downgrading a jang VLM to "batched"
+            # would send it to BatchedEngine (mlx-lm), which cannot load
+            # turboquant tensors.  Known limitation: text-only benchmarks on
+            # jang VLM models will still run the vision loader path.
             else:
                 logger.info(f"Loading model: {model_id}")
 
@@ -1402,6 +1509,17 @@ class EnginePool:
                     logger.warning(
                         "DFlash is not supported for diffusion models; "
                         "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif dflash_enabled and dflash_draft and effective_type == "jang":
+                    # DFlash is unsupported for JANG models: DFlashEngine uses the
+                    # generic mlx-lm/mlx-vlm load path which cannot handle JANG
+                    # turboquant (tq_*) tensors.  Skip dflash and fall through to
+                    # JANGLoader so the mixed-precision quantization is loaded correctly.
+                    logger.warning(
+                        "DFlash is not supported for JANG models (turboquant tensors "
+                        "require JANGLoader); ignoring dflash settings and loading %s "
+                        "with JANGLoader",
                         model_id,
                     )
                 elif dflash_enabled and dflash_draft:
@@ -1466,7 +1584,9 @@ class EnginePool:
 
             # Create engine based on engine type (if DFlash not active)
             if engine is None:
-                if effective_type == "embedding":
+                if effective_type == "remote":
+                    engine = self._build_remote_engine(model_id)
+                elif effective_type == "embedding":
                     engine = EmbeddingEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
@@ -1476,6 +1596,12 @@ class EnginePool:
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "jang":
+                    engine = JANGLoader(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(
@@ -1730,28 +1856,16 @@ class EnginePool:
                 f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
-        except Exception as exc:
+        except Exception:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback
-            # frames (loader-internal locals). Running gc/clear_cache
-            # synchronously here is useless -- the exception is still alive
-            # in the caller. Schedule a deferred reclaim that runs after the
-            # exception has been handled and dropped, so the buffers are
-            # actually released; otherwise the process footprint stays
-            # inflated and the memory-ceiling admission check rejects all
-            # subsequent loads until a server restart.
+            # frames (see the failed-load handler in engine/jang.py). Schedule
+            # a deferred reclaim that runs after the exception has been
+            # handled and dropped by the caller, so gc + clear_cache can
+            # actually release the buffers — otherwise the process footprint
+            # stays inflated and the memory-ceiling admission check keeps
+            # rejecting loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
-            if not entry.abort_loading:
-                self._mark_load_failure(entry, exc)
-                logger.exception(
-                    "Model load failed for '%s'; caching failure until next discovery refresh",
-                    model_id,
-                )
-                raise ModelUnavailableError(
-                    model_id,
-                    f"Model '{model_id}' failed to load: {entry.load_failure_message}. "
-                    "Reload models after fixing the files to retry.",
-                ) from exc
             raise
         finally:
             if (
