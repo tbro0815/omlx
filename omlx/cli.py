@@ -19,7 +19,7 @@ import faulthandler
 import math
 import sys
 
-from ._version import __version__
+from ._version import __display_version__
 
 
 def _positive_float(value: str) -> float:
@@ -77,7 +77,7 @@ def serve_command(args):
     import os
     import uvicorn
 
-    from ._version import __version__
+    from ._version import __display_version__
     from . import process_title
     from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
@@ -93,10 +93,10 @@ def serve_command(args):
     print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
     print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
-        print(f"\033[33m├─ Version: {__version__}\033[0m")
+        print(f"\033[33m├─ Version: {__display_version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
     else:
-        print(f"\033[33m└─ Version: {__version__}\033[0m")
+        print(f"\033[33m└─ Version: {__display_version__}\033[0m")
     print()
 
     # Initialize global settings first (to get log_level from file if not specified)
@@ -757,7 +757,7 @@ Examples:
     parser.add_argument(
         "--version",
         action="version",
-        version=__version__,
+        version=__display_version__,
         help="Print the oMLX version and exit",
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
