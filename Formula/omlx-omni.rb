@@ -8,7 +8,7 @@ class OmlxOmni < Omlx
   homepage "https://github.com/tbro0815/omlx"
   url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.5.1-omni.tar.gz"
   version "0.5.1-omni"
-  sha256 "d82271d8445f10b9da8464ca44c2284494ae0a9d22ada0c8d0656f167fa73e28"
+  sha256 "387d4f2a2386dc76ebacb89b70874122513aa4cb5e098ba9ad602881585cdc74"
 
   # Homebrew does not carry dependencies from a parent formula into a
   # separately-installed child formula.
