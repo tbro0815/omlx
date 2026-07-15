@@ -2190,16 +2190,26 @@ async def update_model_settings(
         }
         if override_value:
             entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            # JANG models must keep the jang engine even with an explicit override.
+            # resolve_jang_engine_type handles the "llm/vlm only" guard so that
+            # embedding/reranker/audio overrides use their own engines even when
+            # jang_config.json is present.
+            from pathlib import Path as _Path
+            from ..model_discovery import resolve_jang_engine_type as _resolve_jang
+            entry.engine_type = _resolve_jang(
+                _Path(entry.model_path), override_value
+            ) or type_to_engine.get(override_value, "batched")
         else:
             # Reset to auto-detected type
             from pathlib import Path
 
-            from ..model_discovery import detect_model_type
+            from ..model_discovery import detect_model_type, resolve_jang_engine_type
 
             detected_type = detect_model_type(Path(entry.model_path))
             entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            entry.engine_type = resolve_jang_engine_type(
+                Path(entry.model_path), detected_type
+            ) or type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:
@@ -6425,3 +6435,332 @@ async def remove_upload_task(task_id: str, is_admin: bool = Depends(require_admi
     if not success:
         raise HTTPException(status_code=404, detail="Task not found or still active")
     return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# External (remote API) models
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _get_external_registry():
+    state = _get_server_state()
+    registry = getattr(state, "external_registry", None)
+    if registry is None:
+        raise HTTPException(
+            status_code=503, detail="External model registry not initialized"
+        )
+    return registry
+
+
+def _server_port() -> int | None:
+    gs = _get_global_settings() if _get_global_settings else None
+    try:
+        return int(gs.server.port) if gs is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+@router.get("/api/external-models")
+async def list_external_models(is_admin: bool = Depends(require_admin)):
+    """List registered external models with load status."""
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+    out = []
+    for m in registry.list():
+        entry = engine_pool.get_entry(m.model_id) if engine_pool else None
+        rec = m.to_dict()
+        rec["loaded"] = bool(entry and entry.engine is not None)
+        rec["has_api_key"] = registry.get_api_key(m.base_url) is not None
+        out.append(rec)
+    return {"models": out}
+
+
+@router.post("/api/external-models")
+async def add_external_model(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    """Register an external model.
+
+    Body: {provider, base_url, remote_model, display_name?, api_key?,
+           context_length?, modality?}
+    """
+    from ..external_models import OPENROUTER_BASE_URL, SelfEndpointError
+
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+    body = await request.json()
+
+    provider = (body.get("provider") or "").strip()
+    base_url = (body.get("base_url") or "").strip()
+    if provider == "openrouter" and not base_url:
+        base_url = OPENROUTER_BASE_URL
+    remote_model = (body.get("remote_model") or "").strip()
+
+    context_length = body.get("context_length")
+    if provider == "apple_fm" and not context_length:
+        # Query the SDK for the real on-device context window instead of
+        # letting the entry fall back to the global default.
+        try:
+            import apple_fm_sdk as fm
+
+            context_length = int(fm.SystemLanguageModel().context_size) or None
+        except Exception:  # noqa: BLE001 — SDK missing or too old
+            context_length = None
+
+    try:
+        model = registry.add(
+            provider=provider,
+            base_url=base_url,
+            remote_model=remote_model,
+            display_name=(body.get("display_name") or "").strip(),
+            api_key=(body.get("api_key") or "").strip() or None,
+            server_port=_server_port(),
+            context_length=context_length,
+            max_output_tokens=body.get("max_output_tokens"),
+            modality=body.get("modality"),
+        )
+    except SelfEndpointError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if engine_pool is not None:
+        # Re-adds are upserts: drop the old entry (unloading it if needed)
+        # so injection recreates it with the refreshed metadata.
+        entry = engine_pool.get_entry(model.model_id)
+        if entry is not None:
+            if entry.engine is not None:
+                await engine_pool._unload_engine(model.model_id)
+            engine_pool._entries.pop(model.model_id, None)
+        engine_pool._inject_external_entries()
+    return {"success": True, "model": model.to_dict()}
+
+
+@router.delete("/api/external-models/{model_id}")
+async def delete_external_model(
+    model_id: str, is_admin: bool = Depends(require_admin)
+):
+    """Remove an external model (unloads it first if loaded)."""
+    registry = _get_external_registry()
+    engine_pool = _get_engine_pool()
+
+    if engine_pool is not None:
+        entry = engine_pool.get_entry(model_id)
+        if entry is not None and entry.engine is not None:
+            await engine_pool._unload_engine(model_id)
+
+    if not registry.remove(model_id):
+        raise HTTPException(status_code=404, detail="External model not found")
+    if engine_pool is not None:
+        engine_pool._inject_external_entries()
+    return {"success": True}
+
+
+@router.post("/api/external-models/catalog")
+async def external_model_catalog(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    """Fetch the provider's model catalog for the picker dropdown.
+
+    Body: {provider, base_url?, api_key?} — uses the stored endpoint key
+    when none is supplied. Returns a normalized list:
+    [{id, name, context_length, modality}].
+    """
+    import httpx as _httpx
+
+    from ..external_models import (
+        OPENROUTER_BASE_URL,
+        SelfEndpointError,
+        validate_not_self_endpoint,
+    )
+
+    registry = _get_external_registry()
+    body = await request.json()
+    provider = (body.get("provider") or "").strip()
+
+    if provider == "apple_fm":
+        # In-process SDK: report availability instead of fetching a catalog.
+        try:
+            import apple_fm_sdk as fm
+        except ImportError:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "apple-fm-sdk is not installed in the oMLX environment. "
+                    "Install with: \"$(brew --prefix omlx)/libexec/bin/pip\" "
+                    "install apple-fm-sdk (requires macOS 26+, Xcode 26+, "
+                    "Apple Intelligence enabled)."
+                ),
+            )
+        model = fm.SystemLanguageModel()
+        is_available, reason = model.is_available()
+        if not is_available:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Apple Foundation Models unavailable: "
+                    f"{getattr(reason, 'name', reason)}"
+                ),
+            )
+        try:
+            afm_ctx = int(model.context_size) or None
+        except Exception:  # noqa: BLE001 — older SDK builds lack the property
+            afm_ctx = None
+        return {
+            "models": [
+                {
+                    "id": "on-device",
+                    "name": "Apple Intelligence (on-device AFM)",
+                    "context_length": afm_ctx,
+                    "modality": "text+image",
+                }
+            ],
+            "base_url": "applefm://local",
+        }
+
+    if provider in ("claude_cli", "codex_cli"):
+        # Subscription relay: report CLI availability + a static model
+        # list (the CLIs accept model aliases, not a queryable catalog).
+        from ..engine.cli_relay import cli_available
+
+        ok, detail = cli_available(provider)
+        if not ok:
+            raise HTTPException(status_code=502, detail=detail)
+        if provider == "claude_cli":
+            models = [
+                {"id": "default", "name": "Subscription default model"},
+                {"id": "opus", "name": "Claude Opus (current)"},
+                {"id": "sonnet", "name": "Claude Sonnet (current)"},
+                {"id": "haiku", "name": "Claude Haiku (current)"},
+            ]
+        else:
+            models = [
+                {"id": "default", "name": "Subscription default model"},
+                {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
+                {"id": "gpt-5.2", "name": "GPT-5.2"},
+            ]
+        for m in models:
+            m.setdefault("context_length", None)
+            m.setdefault("modality", "text")
+        return {"models": models, "base_url": f"cli://{provider.removesuffix('_cli')}"}
+
+    from ..external_models import PRESET_BASE_URLS
+
+    base_url = (body.get("base_url") or "").strip()
+    if not base_url:
+        base_url = PRESET_BASE_URLS.get(provider, "")
+    base_url = base_url.rstrip("/")
+
+    try:
+        validate_not_self_endpoint(base_url, _server_port())
+    except SelfEndpointError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    api_key = (body.get("api_key") or "").strip() or registry.get_api_key(base_url)
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "anthropic":
+            # Anthropic's native /v1/models wants x-api-key.
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+
+    try:
+        async with _httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{base_url}/models", headers=headers)
+    except _httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Catalog fetch failed: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Catalog fetch failed: HTTP {resp.status_code}",
+        )
+
+    try:
+        data = resp.json().get("data", [])
+    except Exception:
+        raise HTTPException(status_code=502, detail="Catalog response not JSON")
+
+    # OpenAI's /models mixes chat models with embeddings/audio/image
+    # endpoints that can't serve chat completions; hide the obvious ones.
+    _OPENAI_NON_CHAT_PREFIXES = (
+        "text-embedding", "whisper", "tts", "dall-e", "omni-moderation",
+        "babbage", "davinci", "text-moderation", "gpt-image", "sora",
+    )
+    # Best-effort context/output caps for families whose catalogs don't
+    # report them (Anthropic/OpenAI omit both from /models).
+    _OPENAI_FAMILY_LIMITS = (
+        ("gpt-5", (400_000, 128_000)),
+        ("o3", (200_000, 100_000)),
+        ("o4", (200_000, 100_000)),
+        ("gpt-4.1", (1_000_000, 32_768)),
+        ("gpt-4o", (128_000, 16_384)),
+    )
+
+    models = []
+    for item in data:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        mid = item["id"]
+        modality = None
+        ctx = item.get("context_length")
+        max_out = None
+        arch = item.get("architecture")
+        if isinstance(arch, dict):
+            modality = arch.get("modality")
+        top = item.get("top_provider")
+        if isinstance(top, dict):
+            max_out = top.get("max_completion_tokens")
+        supports_1m = False
+        if provider == "anthropic":
+            # Uniform across current Claude models; all are multimodal.
+            # 1M context is GA (standard pricing, no beta header) on the
+            # 4.6+ generation; default entries to 200k and let the UI's
+            # 1M checkbox raise it.
+            _1M_FAMILIES = (
+                "sonnet-4-6", "opus-4-6", "opus-4-7", "opus-4-8",
+                "sonnet-5", "opus-5", "fable-5",
+            )
+            supports_1m = any(f in mid for f in _1M_FAMILIES)
+            ctx = ctx or 200_000
+            # Output caps vary by family: 32k (Sonnet 4.6), 64k
+            # (Opus 4.6), 128k (5-generation models).
+            if max_out is None:
+                for fam, cap in (
+                    ("sonnet-4-6", 32_000),
+                    ("opus-4-6", 64_000),
+                    ("opus-4-7", 128_000),
+                    ("opus-4-8", 128_000),
+                    ("sonnet-5", 128_000),
+                    ("opus-5", 128_000),
+                    ("fable-5", 128_000),
+                ):
+                    if fam in mid:
+                        max_out = cap
+                        break
+                else:
+                    max_out = 64_000
+            modality = modality or "text+image"
+        elif provider == "openai":
+            if mid.startswith(_OPENAI_NON_CHAT_PREFIXES):
+                continue
+            for fam, (fam_ctx, fam_out) in _OPENAI_FAMILY_LIMITS:
+                if mid.startswith(fam):
+                    ctx = ctx or fam_ctx
+                    max_out = max_out or fam_out
+                    break
+            modality = modality or "text+image"
+        models.append(
+            {
+                "id": mid,
+                "name": item.get("name") or item.get("display_name") or mid,
+                "context_length": ctx,
+                "max_output_tokens": max_out,
+                "modality": modality,
+                "supports_1m": supports_1m,
+            }
+        )
+    models.sort(key=lambda m: m["id"])
+    return {"models": models, "base_url": base_url}

@@ -1,0 +1,272 @@
+<!-- ==================== EXTERNAL MODELS (remote APIs) ==================== -->
+<div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mt-6">
+    <div class="flex items-center justify-between px-4 sm:px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+        <div class="flex items-center gap-3">
+            <i data-lucide="globe" class="w-4 h-4 text-neutral-500"></i>
+            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">External Models (API)</span>
+            <span class="text-xs text-neutral-400" x-text="extModels.length + ' configured'"></span>
+        </div>
+        <button @click="openExtAdd()"
+                class="px-3 py-1.5 text-xs font-medium text-white bg-neutral-900 hover:bg-neutral-700
+                       rounded-lg transition-all flex items-center gap-1.5">
+            <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+            Add External Model
+        </button>
+    </div>
+    <div class="divide-y divide-neutral-100">
+        <template x-if="extModels.length === 0">
+            <div class="px-6 py-8 text-center">
+                <p class="text-sm text-neutral-500">
+                    No external models yet. Add OpenRouter or any OpenAI-compatible endpoint
+                    to use remote models in chat and benchmarks.
+                </p>
+            </div>
+        </template>
+        <template x-for="model in extModels" :key="model.model_id">
+            <div class="px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-neutral-50 transition-colors">
+                <div class="min-w-0 flex-1 flex items-center gap-2">
+                    <span class="px-1.5 py-0.5 text-[10px] font-semibold rounded uppercase tracking-wide"
+                          :class="{
+                              'openrouter': 'bg-indigo-50 text-indigo-600 border border-indigo-200',
+                              'apple_fm': 'bg-neutral-100 text-neutral-700 border border-neutral-300',
+                              'anthropic': 'bg-orange-50 text-orange-600 border border-orange-200',
+                              'openai': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+                              'claude_cli': 'bg-orange-50 text-orange-600 border border-orange-200',
+                              'codex_cli': 'bg-emerald-50 text-emerald-600 border border-emerald-200',
+                          }[model.provider] || 'bg-teal-50 text-teal-600 border border-teal-200'"
+                          x-text="{
+                              'openrouter': 'OpenRouter',
+                              'apple_fm': 'Apple FM',
+                              'anthropic': 'Anthropic',
+                              'openai': 'OpenAI',
+                              'claude_cli': 'Claude subscr.',
+                              'codex_cli': 'Codex subscr.',
+                          }[model.provider] || 'OpenAI-compat'"></span>
+                    <span class="text-sm font-medium text-neutral-900 truncate"
+                          :title="model.remote_model"
+                          x-text="model.display_name || model.remote_model"></span>
+                    <span class="text-xs text-neutral-400 truncate max-md:hidden" x-text="model.model_id"></span>
+                    <button x-data="{ copied: false }"
+                            @click.stop="copyToClipboard(model.model_id); copied = true; setTimeout(() => copied = false, 2000)"
+                            class="p-1 rounded-md transition-all flex-shrink-0"
+                            :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                            title="Copy model ID (use as 'model' in API requests)">
+                        <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                        <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                    </button>
+                    <template x-if="model.context_length">
+                        <span class="text-xs text-neutral-400 flex-shrink-0"
+                              x-text="'(' + Math.round(model.context_length / 1024) + 'k ctx)'"></span>
+                    </template>
+                    <template x-if="!model.has_api_key && !['apple_fm', 'claude_cli', 'codex_cli'].includes(model.provider)">
+                        <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-600 border border-amber-200">no key</span>
+                    </template>
+                    <template x-if="model.loaded">
+                        <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-green-50 text-green-600 border border-green-200">connected</span>
+                    </template>
+                </div>
+                <div class="flex items-center gap-2 ml-4 shrink-0">
+                    <template x-if="extDeleteConfirm !== model.model_id">
+                        <button @click="extDeleteConfirm = model.model_id"
+                                class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                title="Remove external model">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </template>
+                    <template x-if="extDeleteConfirm === model.model_id">
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs text-red-600">Remove?</span>
+                            <button @click="deleteExternalModel(model.model_id)"
+                                    class="px-2.5 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">Yes</button>
+                            <button @click="extDeleteConfirm = null"
+                                    class="px-2.5 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-lg transition-all">No</button>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+    </div>
+</div>
+
+<!-- Add External Model modal -->
+<div x-show="extAddOpen" x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div class="absolute inset-0 bg-neutral-900/40" @click="extAddOpen = false"></div>
+    <div class="relative bg-white rounded-2xl border border-neutral-200 shadow-xl w-full max-w-lg max-h-[85vh] overflow-y-auto">
+        <div class="px-6 py-4 border-b border-neutral-100 flex items-center justify-between">
+            <h3 class="text-base font-semibold text-neutral-900">Add External Model</h3>
+            <button @click="extAddOpen = false" class="p-1 text-neutral-400 hover:text-neutral-600 rounded">
+                <i data-lucide="x" class="w-4 h-4"></i>
+            </button>
+        </div>
+        <div class="px-6 py-4 space-y-4">
+            <!-- Provider -->
+            <div>
+                <label class="block text-xs font-medium text-neutral-500 mb-1.5">Provider</label>
+                <div class="grid grid-cols-3 gap-2">
+                    <button @click="extProvider = 'openrouter'; extCatalog = []; extError = ''"
+                            :class="extProvider === 'openrouter'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        OpenRouter
+                    </button>
+                    <button @click="extProvider = 'openai_compatible'; extCatalog = []; extError = ''"
+                            :class="extProvider === 'openai_compatible'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        OpenAI-compatible
+                    </button>
+                    <button @click="extProvider = 'apple_fm'; extCatalog = []; extError = ''; extRemoteModel = 'on-device'"
+                            :class="extProvider === 'apple_fm'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Apple FM
+                    </button>
+                    <button @click="extProvider = 'anthropic'; extCatalog = []; extError = ''; extRemoteModel = ''"
+                            :class="extProvider === 'anthropic'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Anthropic
+                    </button>
+                    <button @click="extProvider = 'openai'; extCatalog = []; extError = ''; extRemoteModel = ''"
+                            :class="extProvider === 'openai'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        OpenAI
+                    </button>
+                    <button @click="extProvider = 'claude_cli'; extCatalog = []; extError = ''; extRemoteModel = 'default'"
+                            :class="extProvider === 'claude_cli'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Claude&nbsp;<span class="text-[10px] opacity-70">subscr.</span>
+                    </button>
+                    <button @click="extProvider = 'codex_cli'; extCatalog = []; extError = ''; extRemoteModel = 'default'"
+                            :class="extProvider === 'codex_cli'
+                                ? 'border-neutral-900 bg-neutral-900 text-white'
+                                : 'border-neutral-200 text-neutral-600 hover:border-neutral-400'"
+                            class="px-3 py-2.5 text-sm font-medium rounded-xl border transition-all">
+                        Codex&nbsp;<span class="text-[10px] opacity-70">subscr.</span>
+                    </button>
+                </div>
+            </div>
+            <!-- Base URL -->
+            <div x-show="extProvider === 'openai_compatible'">
+                <label class="block text-xs font-medium text-neutral-500 mb-1.5">Base URL</label>
+                <input type="url" x-model="extBaseUrl" placeholder="https://api.example.com/v1"
+                       class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400">
+                <p class="text-[11px] text-neutral-400 mt-1">
+                    Pointing at this oMLX server itself is blocked (request recursion).
+                </p>
+            </div>
+            <div x-show="extProvider === 'openrouter'">
+                <p class="text-[11px] text-neutral-400">Endpoint: https://openrouter.ai/api/v1</p>
+            </div>
+            <div x-show="extProvider === 'apple_fm'">
+                <p class="text-[11px] text-neutral-400">
+                    On-device Apple Intelligence model via the official Python SDK.
+                    No API key — requires macOS 26+, Xcode 26+ (SDK agreement accepted),
+                    Apple Intelligence enabled, and <span class="font-mono">apple-fm-sdk</span>
+                    installed in the oMLX environment. AFM 3 Cloud / Cloud Pro are not
+                    developer-accessible through Apple's SDK (yet).
+                </p>
+            </div>
+            <div x-show="extProvider === 'anthropic'">
+                <p class="text-[11px] text-neutral-400">
+                    Endpoint: https://api.anthropic.com/v1 (OpenAI-compatible layer).
+                    Uses a Claude API key from platform.claude.com.
+                </p>
+            </div>
+            <div x-show="extProvider === 'openai'">
+                <p class="text-[11px] text-neutral-400">
+                    Endpoint: https://api.openai.com/v1. Uses an OpenAI API key.
+                </p>
+            </div>
+            <div x-show="extProvider === 'claude_cli' || extProvider === 'codex_cli'">
+                <p class="text-[11px] text-neutral-400">
+                    Relays through the locally installed
+                    <span class="font-mono" x-text="extProvider === 'claude_cli' ? 'claude' : 'codex'"></span>
+                    CLI using your subscription sign-in. No API key — oMLX never
+                    sees or stores auth tokens; sign in once via the CLI itself.
+                    Requests run one at a time and sampling settings are managed
+                    by the CLI.
+                </p>
+            </div>
+            <!-- API key -->
+            <div x-show="!['apple_fm', 'claude_cli', 'codex_cli'].includes(extProvider)">
+                <label class="block text-xs font-medium text-neutral-500 mb-1.5">API key</label>
+                <input type="password" x-model="extApiKey" placeholder="sk-…  (stored locally, 0600)"
+                       autocomplete="off"
+                       class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400">
+                <p class="text-[11px] text-neutral-400 mt-1">
+                    Stored per endpoint in <span class="font-mono">~/.omlx/external_keys.json</span>.
+                    Leave empty to reuse a previously saved key for this endpoint.
+                </p>
+            </div>
+            <!-- Model picker -->
+            <div>
+                <div class="flex items-center justify-between mb-1.5">
+                    <label class="block text-xs font-medium text-neutral-500">Model</label>
+                    <button @click="loadExtCatalog()"
+                            :disabled="extCatalogLoading"
+                            class="text-xs font-medium text-blue-600 hover:text-blue-700 disabled:opacity-50 flex items-center gap-1">
+                        <span class="inline-flex" :class="extCatalogLoading && 'animate-spin'"><i data-lucide="refresh-cw" class="w-3 h-3"></i></span>
+                        <span x-text="extCatalogLoading ? 'Loading…' : 'Load model list'"></span>
+                    </button>
+                </div>
+                <template x-if="extCatalog.length > 0">
+                    <div class="space-y-2">
+                        <input type="text" x-model="extCatalogFilter" placeholder="Filter models…"
+                               class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400">
+                        <select x-model="extRemoteModel" size="6"
+                                class="w-full px-2 py-1 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400 font-mono">
+                            <template x-for="m in extFilteredCatalog()" :key="m.id">
+                                <option :value="m.id"
+                                        x-text="m.id + (m.context_length ? '  (' + Math.round(m.context_length/1024) + 'k)' : '')"></option>
+                            </template>
+                        </select>
+                    </div>
+                </template>
+                <input type="text" x-model="extRemoteModel"
+                       :placeholder="extProvider === 'openrouter' ? 'or enter model ID, e.g. deepseek/deepseek-v4' : 'model ID, e.g. my-model'"
+                       class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400 font-mono mt-2">
+            </div>
+            <!-- 1M context (Anthropic 4.6+ generation, GA at standard pricing) -->
+            <div x-show="extProvider === 'anthropic' && ext1mCapable()"
+                 class="flex items-start gap-2 px-3 py-2 bg-neutral-50 border border-neutral-200 rounded-xl">
+                <input type="checkbox" id="ext-use-1m" x-model="extUse1m" class="mt-0.5">
+                <label for="ext-use-1m" class="text-xs text-neutral-600">
+                    <span class="font-medium">Use 1M-token context window</span><br>
+                    <span class="text-neutral-400">
+                        This model supports 1M context at standard pricing (GA since
+                        March 2026, no beta header). Unchecked: 200k. Long-context
+                        benchmark runs still bill per token — pp1M prompts are large.
+                    </span>
+                </label>
+            </div>
+            <!-- Display name -->
+            <div>
+                <label class="block text-xs font-medium text-neutral-500 mb-1.5">Display name (optional)</label>
+                <input type="text" x-model="extDisplayName" placeholder="Shown in model lists"
+                       class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-xl focus:outline-none focus:border-neutral-400">
+            </div>
+            <!-- Error -->
+            <template x-if="extError">
+                <div class="px-3 py-2 text-xs text-red-600 bg-red-50 border border-red-200 rounded-xl" x-text="extError"></div>
+            </template>
+        </div>
+        <div class="px-6 py-4 border-t border-neutral-100 flex justify-end gap-2">
+            <button @click="extAddOpen = false"
+                    class="px-4 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100 rounded-xl transition-all">Cancel</button>
+            <button @click="addExternalModel()" :disabled="extAdding"
+                    class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 hover:bg-neutral-700 rounded-xl transition-all disabled:opacity-50">
+                <span x-text="extAdding ? 'Adding…' : 'Add Model'"></span>
+            </button>
+        </div>
+    </div>
+</div>
