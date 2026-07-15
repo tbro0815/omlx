@@ -57,7 +57,9 @@ class TestDetectModelTypeJangVlm:
         assert detect_model_type(tmp_path) == "llm"
 
     def test_detect_vlm_via_preprocessor_only_for_jang(self, tmp_path):
-        (tmp_path / "jjqf_config.json").write_text(json.dumps({"quantization": {"bits": 2}}))
+        (tmp_path / "jjqf_config.json").write_text(
+            json.dumps({"format": "jjqf", "quantization": {"bits": 2}})
+        )
         (tmp_path / "preprocessor_config.json").write_text(
             json.dumps({"processor_type": "AutoProcessor"})
         )
