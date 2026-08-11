@@ -1120,6 +1120,77 @@ def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
 
 
 @contextlib.contextmanager
+def _force_muse_glimmer_sanitize_on_load(model_dir: Path):
+    """Run ``Model.sanitize()`` for MLX-format Muse Glimmer checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata is ``format=mlx``.
+    Community MLX/MXFP8 conversions of Meta Muse Glimmer (for example
+    ``Shiftedx/Muse-Glimmer-30B-MXFP8-Vision-MLX``) still ship the HF-style
+    ``model.language_model.*`` / ``model.vision_tower.*`` / ``lm_head.*``
+    layout, which only lines up with the mlx-vlm module tree after
+    ``MuseGlimmer.sanitize()`` remaps it.  With sanitize skipped every tensor
+    misses, strict ``load_weights`` fails with "Received N parameters not in
+    model", and the text-only fallback then dies because mlx-lm has no
+    ``muse_glimmer`` architecture.
+
+    Mask the ``format`` key for this model's shards for the duration of the
+    load so the sanitize path runs.  Scoped to muse_glimmer checkpoints, and a
+    no-op for HF-format ones (they are not tagged ``format=mlx``, so sanitize
+    already runs) and for already-flat layouts (sanitize leaves keys that do
+    not carry the prefixes untouched).
+    """
+    if _read_config_model_type(model_dir) != "muse_glimmer":
+        yield
+        return
+
+    import safetensors
+
+    original_safe_open = safetensors.safe_open
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    safetensors.safe_open = _patched_safe_open
+    try:
+        logger.info(
+            "Muse Glimmer MLX-format sanitize patch active for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+
+
+@contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
 
@@ -1785,6 +1856,7 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
+                _force_muse_glimmer_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(

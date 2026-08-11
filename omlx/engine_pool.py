@@ -2200,7 +2200,7 @@ class EnginePool:
                 f"estimated: {format_size(entry.estimated_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
-        except Exception:
+        except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights
             # reachable only through the propagating exception's traceback
             # frames (see the failed-load handler in engine/jang.py). Schedule
