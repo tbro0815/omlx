@@ -69,12 +69,38 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def _probe_mask_fold(ext) -> bool:
+    """True iff the built extension accepts the mask-fold kwargs.
+
+    ``dsa_indexer_scores`` grew ``mask_ratio``/``mask_q_offset`` after the
+    first native builds shipped. An older ``_ext`` parses no such kwargs, so
+    passing them unconditionally raises ``TypeError`` for every caller —
+    including GLM-5.2's historical unmasked path. Nanobind renders named
+    args into ``__doc__``, so probe the signature once at import; callers
+    on older builds keep the historical call signature and the mask is
+    applied in a second pass with identical sentinel semantics.
+    """
+    fn = getattr(ext, "dsa_indexer_scores", None)
+    if fn is None:
+        return False
+    doc = getattr(fn, "__doc__", None) or ""
+    return "mask_ratio" in doc and "mask_q_offset" in doc
+
+
+_EXT_MASK_FOLD = _probe_mask_fold(_ext)
+
+
 NATIVE_SYMBOLS = (
+    "dsa_decode_scores",
     "dsa_indexer_scores",
     "dsa_topk_indices",
+    "dspark_fp32_topk_indices",
+    "dspark_exact_mxfp8_qmv_pair",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
     "deepseek_v4_sparse_attention",
+    "dspark_ring_gemm",
+    "dspark_rowwise_gemm",
     "glm_dsa_q8_vup_flat",
     "glm_moe_weighted_sum",
     "deepseek_mxfp4_gather_qmm_blocks",
@@ -123,11 +149,39 @@ def dsa_indexer_scores(
     unused_causal_prefix_topk: int = 0,
     skip_causal_future_store: bool = False,
     causal_q_offset: int = -1,
+    mask_ratio: int = 0,
+    mask_q_offset: int = 0,
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None:
+    """Head-summed DSA indexer scores.
+
+    ``mask_ratio > 0`` folds the pooled-ratio causal mask into the kernel
+    epilogue: pooled column ``c`` is masked for query row ``r`` iff
+    ``c >= (mask_q_offset + r + 1) // mask_ratio`` and receives the
+    ``finfo(dtype).min`` sentinel — bit-identical to applying
+    ``mx.where(mask, scores, finfo.min)`` in a second pass. ``mask_ratio=0``
+    (default) is the historical unmasked behavior. On extension builds
+    predating the fold kwargs, the historical call signature is kept and
+    the same mask is applied in a second pass with identical semantics.
+    """
+    if _ext is not None and _EXT_MASK_FOLD:
         return _ext.dsa_indexer_scores(
+            queries,
+            keys,
+            weights,
+            causal=causal,
+            unused_causal_prefix_topk=unused_causal_prefix_topk,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            mask_ratio=mask_ratio,
+            mask_q_offset=mask_q_offset,
+            **_native_stream_kwargs(stream),
+        )
+    if _ext is not None:
+        # Older build without the mask-fold kwargs: keep the historical
+        # call signature; the mask is applied in a second pass below.
+        scores = _ext.dsa_indexer_scores(
             queries,
             keys,
             weights,
@@ -137,15 +191,49 @@ def dsa_indexer_scores(
             causal_q_offset=causal_q_offset,
             **_native_stream_kwargs(stream),
         )
-    return mx.fast.dsa_indexer_scores(
+    else:
+        scores = mx.fast.dsa_indexer_scores(
+            queries,
+            keys,
+            weights,
+            causal=causal,
+            unused_causal_prefix_topk=unused_causal_prefix_topk,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            stream=stream or mx.gpu,
+        )
+    if mask_ratio > 0:
+        # Preserve the fused kernel's exact sentinel semantics on the
+        # non-fused paths (same validity rule, same finfo.min sentinel).
+        L = queries.shape[2]
+        P = keys.shape[2]
+        pool_idx = mx.arange(P)
+        query_idx = mx.arange(mask_q_offset + 1, mask_q_offset + L + 1)
+        mask = pool_idx < query_idx[:, None] // mask_ratio
+        scores = mx.where(
+            mask[None, None], scores, mx.finfo(scores.dtype).min
+        )
+    return scores
+
+
+def dsa_decode_scores(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    fp32_scores: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None:
+        raise RuntimeError(
+            "dsa_decode_scores requires the native glm_moe_dsa extension"
+        )
+    return _ext.dsa_decode_scores(
         queries,
         keys,
         weights,
-        causal=causal,
-        unused_causal_prefix_topk=unused_causal_prefix_topk,
-        skip_causal_future_store=skip_causal_future_store,
-        causal_q_offset=causal_q_offset,
-        stream=stream or mx.gpu,
+        fp32_scores=fp32_scores,
+        **_native_stream_kwargs(stream),
     )
 
 
@@ -171,6 +259,21 @@ def dsa_topk_indices(
         bucketed=bucketed,
         causal_valid_prefix=causal_valid_prefix,
         stream=stream or mx.gpu,
+    )
+
+
+def dspark_fp32_topk_indices(
+    scores: mx.array,
+    topk: int = 512,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_fp32_topk_indices"):
+        raise RuntimeError("DSpark FP32 top-k kernel is unavailable")
+    return _ext.dspark_fp32_topk_indices(
+        scores,
+        topk,
+        **_native_stream_kwargs(stream),
     )
 
 
@@ -251,6 +354,63 @@ def glm_dsa_exact_block_attention(
         scale,
         causal=causal,
         stream=stream or mx.gpu,
+    )
+
+
+def dspark_rowwise_gemm(
+    lhs: mx.array,
+    rhs: mx.array,
+    transpose_rhs: bool,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_rowwise_gemm"):
+        raise RuntimeError("DSpark rowwise NAX GEMM is unavailable")
+    return _ext.dspark_rowwise_gemm(
+        lhs,
+        rhs,
+        transpose_rhs,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def dspark_ring_gemm(
+    lhs: mx.array,
+    source: mx.array,
+    indices: mx.array,
+    transpose_rhs: bool,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_ring_gemm"):
+        raise RuntimeError("DSpark physical-ring GEMM is unavailable")
+    return _ext.dspark_ring_gemm(
+        lhs,
+        source,
+        indices,
+        transpose_rhs,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def dspark_exact_mxfp8_qmv_pair(
+    input: mx.array,
+    weight_a: mx.array,
+    scales_a: mx.array,
+    weight_b: mx.array,
+    scales_b: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "dspark_exact_mxfp8_qmv_pair"):
+        raise RuntimeError("DSpark exact MXFP8 QMV pair kernel is unavailable")
+    return _ext.dspark_exact_mxfp8_qmv_pair(
+        input,
+        weight_a,
+        scales_a,
+        weight_b,
+        scales_b,
+        **_native_stream_kwargs(stream),
     )
 
 

@@ -11,7 +11,17 @@ from typing import Any, List
 from .openai_models import Message
 
 # Model families whose chat templates consume message.reasoning_content directly.
-_NATIVE_REASONING_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
+_NATIVE_REASONING_MODEL_TYPES = {
+    "minimax_m3",
+    "minimax_m3_vl",
+    # Inkling's chat template renders history reasoning_content back into
+    # <|content_thinking|> blocks.
+    "inkling",
+    "inkling_mm_model",
+    # Muse Glimmer's chat template renders history reasoning_content into
+    # <|start|>assistant to=self<|message|> blocks.
+    "muse_glimmer",
+}
 
 
 def uses_native_reasoning_content(
@@ -367,6 +377,13 @@ def chat_template_preserves_mid_system(
     if placement not in {"tail", "between"}:
         return False
 
+    explicit_capability = getattr(tokenizer, "_omlx_supports_mid_system_messages", None)
+    if explicit_capability is None:
+        template = getattr(tokenizer, "_chat_template", None)
+        explicit_capability = getattr(template, "supports_mid_system_messages", None)
+    if explicit_capability is False:
+        return False
+
     has_tools = bool(tools)
     cache_key = _mid_system_probe_cache_key(
         tokenizer,
@@ -649,8 +666,9 @@ def prepare_system_messages_for_template(
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
 
-    Unsupported placements or templates fall back to the historical behavior:
-    all system messages are consolidated at the front.
+    Model-specific templates may first relocate supported system turns to a
+    native reminder role. Unsupported placements or templates then use the
+    configured strict or user-note fallback.
     """
     messages = [dict(msg) for msg in messages]
     if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
@@ -674,6 +692,19 @@ def prepare_system_messages_for_template(
                     prepared = _merge_consecutive_roles(prepared)
                 return prepared
         return strict_fallback()
+
+    if not is_partial and has_nonleading_system_message(messages):
+        relocator = getattr(tokenizer, "_omlx_relocate_mid_system_messages", None)
+        if relocator is None:
+            template = getattr(tokenizer, "_chat_template", None)
+            relocator = getattr(template, "relocate_mid_system_messages", None)
+        if callable(relocator):
+            try:
+                relocated = relocator(messages)
+            except Exception:
+                relocated = None
+            if relocated is not None:
+                messages = [dict(msg) for msg in relocated]
 
     placements = _mid_system_placement_kinds(messages)
     if not placements:

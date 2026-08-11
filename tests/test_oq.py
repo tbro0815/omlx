@@ -26,10 +26,17 @@ from omlx.oq import (
     _PROXY_QUANT_GROUP_SIZE,
     _ROUTED_LAYER_BOOST_LEVELS,
     OQ_LEVELS,
+    OQImatrixCollector,
+    OQImatrixEntry,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
     _build_streaming_proxy_for_sensitivity,
+    _calibration_memory_budget,
+    _checkpoint_storage_bytes,
+    _collect_imatrix_from_model,
+    _commit_layer_forward_aux,
+    _configure_minimax_shared_expert_layout,
     _config_expects_moe_expert_counts,
     _discover_sanitize_plan,
     _DiscoveredPlan,
@@ -38,27 +45,32 @@ from omlx.oq import (
     _forward_layer,
     _forward_layer_result,
     _get_predicate_bits,
-    _ImatrixCaptureWrapper,
     _imatrix_expert_coverage_stats,
     _imatrix_expert_coverage_sufficient,
     _imatrix_requires_expert_counts,
+    _ImatrixCaptureWrapper,
     _is_audio_tensor,
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
     _load_builtin_calibration,
     _measure_sensitivity,
+    _measure_sensitivity_from_model,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
+    _normalize_sensitivity_map_override,
+    _oqe_calibration_batch_plan,
     _perturb_bits_for,
+    _prepare_layer_inputs,
     _progress_total_bytes,
     _quantize_chunked,
     _sensitivity_lm_config_override,
     _should_quantize_tensor,
+    _source_imatrix_signature,
+    _source_has_nextn_tensors,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
-    OQImatrixCollector,
-    OQImatrixEntry,
+    _uses_minimax_mxfp8_scale_inv_source,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -115,6 +127,26 @@ class TestUniversalQuantPredicate:
             "model.layers.0.shared_expert_gate", module, moe_config
         )
         assert isinstance(result, dict) and result["bits"] == 8
+
+    def test_shared_expert_weights_are_8bit(self, moe_config, module):
+        result = universal_quant_predicate(
+            "model.layers.0.block_sparse_moe.shared_experts.down_proj",
+            module,
+            {**moe_config, "num_local_experts": 128},
+        )
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    def test_shared_expert_floor_survives_budget_plan(self, moe_config, module):
+        result = universal_quant_predicate(
+            "model.layers.0.block_sparse_moe.shared_experts.down_proj",
+            module,
+            {
+                **moe_config,
+                "num_local_experts": 128,
+                "_oq_use_budget_plan": True,
+            },
+        )
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
 
     def test_non_quantizable_module_skipped(self, dense_config, module):
         cfg = {
@@ -244,6 +276,36 @@ class TestUniversalQuantPredicate:
         )
         assert isinstance(result, dict)
         assert result["bits"] == 6
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk.weight",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b.weight",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj.weight",
+        ],
+    )
+    def test_glm_dsa_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "glm_moe_dsa",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3.5)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
+    def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.indexer.wq_b",
+            module,
+            {"model_type": model_type},
+            3.5,
+        )
+        assert result is True
 
     def test_dense_o_proj_5bit(self, dense_config, module):
         result = universal_quant_predicate(
@@ -418,6 +480,59 @@ class TestUniversalQuantPredicate:
             "model.layers.10.self_attn.q_proj", module, config
         )
         assert result is True  # should not crash on None > 0
+
+
+class TestMuseGlimmerQuantPredicate:
+    """Muse Glimmer (dense VLM, gated attention) predicate behavior."""
+
+    @pytest.fixture
+    def muse_config(self):
+        return {
+            "model_type": "muse_glimmer",
+            "num_hidden_layers": 52,
+            "hidden_size": 6656,
+        }
+
+    @pytest.fixture
+    def module(self):
+        return MagicMock(spec=[])
+
+    def test_vision_stack_not_quantized(self, muse_config, module):
+        # Sanitized runtime paths: vision_tower.* / vision_adapter.* /
+        # vision_projection.* — all must stay fp16 via _is_vision_tensor.
+        for path in (
+            "vision_tower.layers.0.attn.q_proj",
+            "vision_adapter.fc1",
+            "vision_projection",
+            "vision_tower.patch_embedder.patch_embedding",
+        ):
+            assert universal_quant_predicate(path, module, muse_config) is False
+
+    def test_embed_tokens_quantized(self, muse_config, module):
+        # NormedEmbedding must go through to_quantized (the vendored
+        # QuantizedNormedEmbedding keeps embed_norm; a False here would
+        # leave a 2.7 GB fp16 embedding in every oQ artifact).
+        result = universal_quant_predicate(
+            "language_model.model.embed_tokens", module, muse_config
+        )
+        assert result is not False
+
+    def test_attention_gate_proj_quantized(self, muse_config, module):
+        # Muse's attention output gate is self_attn.gate_proj — it must not
+        # be caught by the MoE-router fp16 rule (which matches mlp gates).
+        result = universal_quant_predicate(
+            "language_model.model.layers.10.self_attn.gate_proj",
+            module,
+            muse_config,
+        )
+        assert result is not False
+
+    def test_lm_head_protected(self, muse_config, module):
+        result = universal_quant_predicate(
+            "language_model.lm_head", module, muse_config
+        )
+        assert result is not False
+        assert isinstance(result, dict) and result["bits"] >= 6
 
 
 # =============================================================================
@@ -730,12 +845,64 @@ class TestNormalizeMtpInConfig:
         # Non-mtp fields untouched.
         assert cfg["text_config"]["num_hidden_layers"] == 64
 
+    def test_removes_dspark_discriminator_fields(self):
+        from omlx.oq import _normalize_mtp_in_config
+
+        cfg = {
+            "num_nextn_predict_layers": 1,
+            "dspark_block_size": 5,
+            "dspark_noise_token_id": 128799,
+            "dspark_target_layer_ids": [40, 41, 42],
+            "dspark_markov_rank": 256,
+        }
+        _normalize_mtp_in_config(cfg)
+        assert cfg["num_nextn_predict_layers"] == 0
+        assert not any(key.startswith("dspark_") for key in cfg)
+
     def test_no_mtp_fields_is_noop(self):
         from omlx.oq import _normalize_mtp_in_config
 
         cfg = {"model_type": "llama"}
         _normalize_mtp_in_config(cfg)
         assert cfg == {"model_type": "llama"}
+
+
+class TestSourceHasNextnTensors:
+    @pytest.mark.parametrize(
+        "prefix",
+        (
+            "model.layers.45",
+            "language_model.model.layers.45",
+            "model.language_model.layers.45",
+        ),
+    )
+    def test_accepts_runtime_and_vlm_prefixes(self, prefix):
+        config = {
+            "model_type": "step3p7",
+            "text_config": {
+                "model_type": "step3p5",
+                "num_hidden_layers": 45,
+                "num_nextn_predict_layers": 3,
+            },
+        }
+
+        assert _source_has_nextn_tensors(
+            [f"{prefix}.eh_proj.weight"], config
+        ) is True
+
+    def test_rejects_backbone_only_weights(self):
+        config = {
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 3,
+        }
+
+        assert (
+            _source_has_nextn_tensors(
+                ["language_model.model.layers.44.self_attn.q_proj.weight"],
+                config,
+            )
+            is False
+        )
 
 
 # =============================================================================
@@ -764,6 +931,41 @@ class TestValidateQuantizable:
         assert (
             validate_quantizable({"quantization_config": {"quant_method": "fp8"}})
             is True
+        )
+
+    def test_mxfp8_native_is_quantizable(self):
+        # MiniMax M3 publishes reconstructable FP8 weights under this method.
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "mxfp8"}})
+            is True
+        )
+
+    def test_quantized_sensitivity_routing_preserves_glm_fp8_dequant(self):
+        from omlx.oq import _uses_quantized_source_sensitivity
+
+        assert (
+            _uses_quantized_source_sensitivity(
+                {"quantization_config": {"quant_method": "mxfp8"}}
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "glm_moe_dsa",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is False
         )
 
     def test_compressed_tensors_float_quantized_is_quantizable(self):
@@ -1074,6 +1276,38 @@ class TestLevelBudgetPlan:
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
         assert boost["bits"] == 4
+
+    def test_glm_dsa_indexer_q8_is_seeded_outside_budget_cap(self):
+        paths = [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj",
+        ]
+        named_shapes = {path: (64, 64) for path in paths}
+        named_shapes["model.layers.0.mlp.switch_mlp.gate_proj"] = (8, 64, 64)
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            3.5,
+            target_bpw=3.01,
+            hard_cap_bpw=3.02,
+        )
+        for path in paths:
+            assert plan.boost_map[path] == {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            }
 
     def test_oq35_predicate_floor_for_expert_down_proj(self):
         """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""
@@ -1455,6 +1689,210 @@ class TestForwardLayer:
         assert isinstance(result, mx.array)
         assert aux == "next_topk"
         assert seen == [("mask", None, "prev_topk")]
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4StatefulLayerForward:
+    @staticmethod
+    def _tiny_model(backend: str):
+        common = {
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "vocab_size": 32,
+            "vocab_size_per_layer_input": 32,
+            "hidden_size_per_layer_input": 4,
+            "num_kv_shared_layers": 1,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+            "use_double_wide_mlp": False,
+        }
+        if backend == "mlx_vlm":
+            config_module = pytest.importorskip("mlx_vlm.models.gemma4.config")
+            language_module = pytest.importorskip("mlx_vlm.models.gemma4.language")
+            config = config_module.TextConfig(**common)
+            return language_module.Gemma4TextModel(config)
+
+        gemma4_text = pytest.importorskip("mlx_lm.models.gemma4_text")
+        config = gemma4_text.ModelArgs(**common)
+        return gemma4_text.Gemma4TextModel(config)
+
+    @pytest.mark.parametrize("backend", ["mlx_vlm", "mlx_lm"])
+    def test_manual_layer_walk_matches_native_forward(self, backend):
+        model = self._tiny_model(backend)
+        tokens = mx.array([[1, 2, 3]])
+
+        expected = model(tokens)
+        raw_inputs = model.embed_tokens(tokens)
+        hidden, masks, state = _prepare_layer_inputs(
+            model, model.layers, tokens, raw_inputs
+        )
+
+        assert state["kind"] == "gemma4_shared_kv"
+        assert state["previous_kvs"] == [0, 0]
+        for layer_idx, layer in enumerate(model.layers):
+            hidden, aux = _forward_layer_result(
+                layer,
+                hidden,
+                masks[layer_idx],
+                state,
+                layer_idx=layer_idx,
+            )
+            _commit_layer_forward_aux(state, layer_idx, aux)
+        actual = model.norm(hidden)
+        mx.eval(expected, actual)
+
+        np.testing.assert_allclose(
+            np.asarray(actual.astype(mx.float32)),
+            np.asarray(expected.astype(mx.float32)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_imatrix_and_sensitivity_cover_shared_kv_tail(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        model = self._tiny_model("mlx_vlm")
+        tokens = mx.array([[1, 2, 3], [3, 2, 1]])
+        monkeypatch.setattr(
+            oq_module,
+            "_load_calibration_data",
+            lambda *_args, **_kwargs: tokens,
+        )
+
+        config = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 1,
+                "hidden_size_per_layer_input": 4,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "layer_types": ["sliding_attention", "sliding_attention"],
+            },
+        }
+        entries, metadata = _collect_imatrix_from_model(
+            model,
+            tokenizer=None,
+            config=config,
+            calib_dataset="test",
+            num_samples=2,
+            seq_length=3,
+        )
+
+        assert metadata["processed_samples"] == 2
+        assert "layers.0.self_attn.k_proj" in entries
+        assert "layers.1.self_attn.q_proj" in entries
+        assert "layers.1.self_attn.o_proj" in entries
+        assert "layers.1.mlp.down_proj" in entries
+        assert "layers.1.per_layer_projection" in entries
+        assert "layers.1.self_attn.k_proj" not in entries
+
+        sensitivity = _measure_sensitivity_from_model(
+            model,
+            tokenizer=None,
+            config=config,
+            oq_level=4,
+            calib_dataset="test",
+            num_samples=2,
+            seq_length=3,
+        )
+        assert set(sensitivity) == {0, 1}
+
+    def test_vlm_wrapper_uses_nested_text_model_as_layer_owner(self):
+        text_model = self._tiny_model("mlx_vlm")
+
+        class LanguageModel:
+            model = text_model
+
+            @property
+            def layers(self):
+                return self.model.layers
+
+        class VlmConfig:
+            model_type = "gemma4"
+
+        class VlmWrapper:
+            config = VlmConfig()
+            language_model = LanguageModel()
+
+            @property
+            def layers(self):
+                return self.language_model.layers
+
+        model = VlmWrapper()
+        tokens = mx.array([[1, 2, 3]])
+        inputs = text_model.embed_tokens(tokens)
+        _, _, state = _prepare_layer_inputs(model, model.layers, tokens, inputs)
+
+        assert state["kind"] == "gemma4_shared_kv"
+        assert state["previous_kvs"] == [0, 0]
+
+    def test_cache_signature_invalidates_only_stateful_gemma4(self, tmp_path):
+        common = {
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 35,
+            },
+        }
+        e2b = {
+            **common,
+            "text_config": {
+                **common["text_config"],
+                "num_kv_shared_layers": 20,
+                "hidden_size_per_layer_input": 256,
+            },
+        }
+        dense = {
+            **common,
+            "text_config": {
+                **common["text_config"],
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+            },
+        }
+
+        kwargs = {
+            "num_samples": 128,
+            "seq_length": 512,
+            "calib_dataset": "test",
+        }
+        e2b_signature = _source_imatrix_signature(tmp_path, e2b, **kwargs)
+        dense_signature = _source_imatrix_signature(tmp_path, dense, **kwargs)
+
+        assert e2b_signature["layer_walk"] == "gemma4_shared_kv_v1"
+        assert "layer_walk" not in dense_signature
+
+    def test_dense_gemma4_keeps_generic_layer_path(self):
+        class Config:
+            model_type = "gemma4_text"
+            num_kv_shared_layers = 0
+            hidden_size_per_layer_input = 0
+
+        class DenseGemma4:
+            model_type = "gemma4_text"
+            config = Config()
+            layers = [object(), object()]
+
+        model = DenseGemma4()
+        tokens = mx.array([[1, 2, 3]])
+        inputs = mx.ones((1, 3, 8))
+        prepared, masks, state = _prepare_layer_inputs(
+            model, model.layers, tokens, inputs
+        )
+
+        assert prepared is inputs
+        assert len(masks) == 2
+        assert not isinstance(state, dict)
 
 
 # =============================================================================
@@ -2301,8 +2739,7 @@ class TestDiscoverSanitizePlan:
 
 
 class TestModelExceedsRamGuard:
-    """Tests for the OOM guard that skips memory-intensive paths when a model
-    is larger than system RAM."""
+    """Tests for the full-model calibration memory admission guard."""
 
     @pytest.fixture
     def sf_file(self, tmp_path):
@@ -2324,17 +2761,204 @@ class TestModelExceedsRamGuard:
         idx = _LazyTensorIndex([path])
         assert idx.nbytes() == expected_bytes
 
-    def test_guard_boundary(self, sf_file):
-        """Guard uses strict > with _MAX_MODEL_RAM_FRACTION of system RAM."""
+    def test_checkpoint_storage_includes_safetensors_header(self, sf_file):
         path, expected_bytes = sf_file
-        idx = _LazyTensorIndex([path])
-        nbytes = idx.nbytes()
-        # Exceeds when "system RAM" is small enough
-        small_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) - 1
-        assert nbytes > int(small_ram * _MAX_MODEL_RAM_FRACTION)
-        # Does not exceed when system RAM is large
-        large_ram = int(nbytes / _MAX_MODEL_RAM_FRACTION) + 1
-        assert not (nbytes > int(large_ram * _MAX_MODEL_RAM_FRACTION))
+
+        assert _checkpoint_storage_bytes([path]) == path.stat().st_size
+        assert path.stat().st_size > expected_bytes
+
+    def test_checkpoint_storage_counts_hidden_fp8_scales(self, tmp_path):
+        weight = np.zeros((64, 64), dtype=np.uint8)
+        scales = np.full((64, 2), 127, dtype=np.uint8)
+        path = tmp_path / "mxfp8.safetensors"
+        _write_safetensors(
+            str(path),
+            {
+                "layer.weight": (
+                    weight.tobytes(),
+                    list(weight.shape),
+                    "F8_E4M3",
+                ),
+                "layer.weight_scale_inv": (
+                    scales.tobytes(),
+                    list(scales.shape),
+                    "U8",
+                ),
+            },
+        )
+
+        index = _LazyTensorIndex([path])
+
+        assert index.nbytes() == weight.nbytes
+        assert _checkpoint_storage_bytes([path]) >= weight.nbytes + scales.nbytes
+
+    @pytest.mark.parametrize("capacity_gib", [16, 32, 64])
+    def test_budget_reserves_25_percent_on_smaller_systems(
+        self, monkeypatch, capacity_gib
+    ):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        capacity = capacity_gib * gib
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
+        )
+
+        budget = _calibration_memory_budget()
+
+        assert budget["capacity_bytes"] == capacity
+        assert budget["model_limit_bytes"] == int(capacity * 0.75)
+        assert budget["reserve_bytes"] == capacity - int(capacity * 0.75)
+
+    def test_budget_uses_smaller_metal_working_set(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 512 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 464 * gib
+        )
+
+        budget = _calibration_memory_budget(413 * gib)
+
+        assert budget["capacity_bytes"] == 464 * gib
+        assert budget["model_limit_bytes"] == 348 * gib
+        assert budget["requires_proxy"] is True
+
+    def test_guard_boundary_is_strict(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        capacity = 4000
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: capacity
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: capacity
+        )
+
+        at_limit = int(capacity * _MAX_MODEL_RAM_FRACTION)
+        assert _calibration_memory_budget(at_limit)["requires_proxy"] is False
+        assert _calibration_memory_budget(at_limit + 1)["requires_proxy"] is True
+
+
+class TestOqeCalibrationBatchPlan:
+    def test_subtracts_lazy_model_footprint(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 64 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 48 * gib
+        )
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=40 * gib,
+        )
+
+        assert plan["live_available_bytes"] == 48 * gib
+        assert plan["remaining_available_bytes"] == 8 * gib
+        assert plan["fits_one_sample"] is True
+
+    def test_near_limit_falls_back_to_one_sample(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        mib = 1024**2
+        live = 1024 * mib
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: live)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: live)
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=1000 * mib,
+        )
+
+        assert plan["micro_batch_size"] == 1
+        assert plan["fits_one_sample"] is True
+
+    def test_reports_when_one_sample_cannot_fit(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        mib = 1024**2
+        live = 1024 * mib
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: live)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: live)
+
+        plan = _oqe_calibration_batch_plan(
+            {"hidden_size": 4096},
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=1020 * mib,
+        )
+
+        assert plan["micro_batch_size"] == 1
+        assert plan["fits_one_sample"] is False
+
+    def test_gemma4_shared_kv_state_reduces_micro_batch(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: 512 * gib
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: 464 * gib
+        )
+        dense = _oqe_calibration_batch_plan(
+            {
+                "model_type": "gemma4",
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 42,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 0,
+                    "hidden_size_per_layer_input": 0,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                },
+            },
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=15 * gib,
+        )
+        e4b = _oqe_calibration_batch_plan(
+            {
+                "model_type": "gemma4",
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 2560,
+                    "num_hidden_layers": 42,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": 18,
+                    "hidden_size_per_layer_input": 256,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                    "layer_types": ["sliding_attention"] * 20
+                    + ["full_attention"] * 4
+                    + ["sliding_attention"] * 18,
+                },
+            },
+            requested_samples=128,
+            seq_length=512,
+            model_bytes=15 * gib,
+        )
+
+        assert dense["gemma4_state_bytes"] == 0
+        assert e4b["gemma4_state_bytes"] > 0
+        assert e4b["estimated_sample_bytes"] > dense["estimated_sample_bytes"]
+        assert e4b["micro_batch_size"] < dense["micro_batch_size"]
 
 
 class TestQuantProgressTotalBytes:
@@ -2532,10 +3156,13 @@ class TestSensitivityRequiredEnforcement:
         )
         (src / "config.json").write_text('{"model_type": "llama"}')
 
-        # Force OOM by pretending system has 0 bytes of RAM.
+        # Force proxy admission by pretending no calibration memory is live.
+        from omlx import oq as _oq
         from omlx import settings as _settings
 
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
         with pytest.raises(RuntimeError, match="auto_proxy_sensitivity is disabled"):
             quantize_oq_streaming(
@@ -2574,6 +3201,9 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
 
         from omlx import oq as _oq
+
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
 
         # Stub the auto-proxy sensitivity path so the run reaches discovery.
         monkeypatch.setattr(
@@ -2620,6 +3250,9 @@ class TestSensitivityRequiredEnforcement:
         monkeypatch.setattr(_settings, "get_system_memory", lambda: 0)
         from omlx import oq as _oq
 
+        monkeypatch.setattr(_oq, "_system_available_memory_bytes", lambda: 0)
+        monkeypatch.setattr(_oq, "_metal_available_memory_bytes", lambda: 0)
+
         monkeypatch.setattr(
             _oq,
             "_build_streaming_proxy_for_sensitivity",
@@ -2633,6 +3266,87 @@ class TestSensitivityRequiredEnforcement:
                 4,
                 auto_proxy_sensitivity=True,
             )
+
+    def test_oversized_proxy_is_rejected_and_cleaned(self, tmp_path, monkeypatch):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as oq_module
+
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
+        proxy = tmp_path / "proxy"
+
+        def _fake_build(*_args, **_kwargs):
+            proxy.mkdir()
+            (proxy / "model.safetensors").write_bytes(b"x" * 800)
+            return proxy
+
+        monkeypatch.setattr(oq_module, "_build_proxy_for_sensitivity", _fake_build)
+
+        with pytest.raises(RuntimeError, match="calibration proxy is still too large"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                auto_proxy_sensitivity=True,
+            )
+
+        assert not proxy.exists()
+
+    def test_oqe_uses_proxy_when_source_exceeds_live_limit(self, tmp_path, monkeypatch):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text('{"model_type": "llama"}')
+
+        from omlx import oq as oq_module
+
+        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
+        proxy = tmp_path / "proxy"
+        build_proxy = MagicMock()
+
+        def _fake_build(*_args, **_kwargs):
+            build_proxy()
+            proxy.mkdir()
+            (proxy / "model.safetensors").write_bytes(b"x" * 100)
+            return proxy
+
+        def _fake_imatrix(*_args, load_path_factory=None, **_kwargs):
+            assert load_path_factory is not None
+            assert load_path_factory() == str(proxy)
+            raise RuntimeError("stop after proxy selection")
+
+        monkeypatch.setattr(oq_module, "_build_proxy_for_sensitivity", _fake_build)
+        monkeypatch.setattr(oq_module, "_load_or_collect_imatrix", _fake_imatrix)
+
+        with pytest.raises(RuntimeError, match="stop after proxy selection"):
+            quantize_oq_streaming(
+                str(src),
+                str(tmp_path / "out"),
+                4,
+                enhanced=True,
+            )
+
+        build_proxy.assert_called_once()
+        assert not proxy.exists()
 
 
 # =============================================================================
@@ -2660,6 +3374,43 @@ class TestOnTheFlyFp8Dequant:
         assert "layer.weight_scale_inv" not in idx
         result = idx["layer.weight"]
         assert result.dtype == mx.bfloat16
+
+    def test_minimax_mxfp8_u8_scale_inv_can_pass_through_bit_exact(self, tmp_path):
+        weight = np.arange(64 * 64, dtype=np.uint8).reshape(64, 64)
+        scales = np.arange(64 * 2, dtype=np.uint8).reshape(64, 2)
+        path = str(tmp_path / "minimax_mxfp8.safetensors")
+        _write_safetensors(
+            path,
+            {
+                "layer.weight": (
+                    weight.tobytes(),
+                    list(weight.shape),
+                    "F8_E4M3",
+                ),
+                "layer.weight_scale_inv": (
+                    scales.tobytes(),
+                    list(scales.shape),
+                    "U8",
+                ),
+            },
+        )
+
+        conservative = _LazyTensorIndex([path])
+        assert conservative.source_quant_info("layer.weight") is None
+
+        native = _LazyTensorIndex([path], allow_mxfp8_scale_inv_passthrough=True)
+        assert native.source_quant_info("layer.weight") == {
+            "kind": "minimax_mxfp8",
+            "bits": 8,
+            "group_size": 32,
+            "mode": "mxfp8",
+        }
+        packed_weight, packed_scales = native._load_packed("layer.weight")
+        mx.eval(packed_weight, packed_scales)
+
+        unpacked_bytes = np.asarray(packed_weight).view(np.uint8).reshape(weight.shape)
+        np.testing.assert_array_equal(unpacked_bytes, weight)
+        np.testing.assert_array_equal(np.asarray(packed_scales), scales)
 
     def test_mxfp_dot_scale_convention(self, tmp_path):
         """MXFP convention: key.weight (F8_E4M3) + key.scale (F8_E8M0)."""
@@ -3289,6 +4040,88 @@ class TestQuantizeOqStreamingFp8:
         out_shards = list(out.glob("*.safetensors"))
         assert len(out_shards) > 0
 
+    def test_minimax_mxfp8_scale_inv_source_produces_output(self, tmp_path):
+        """MiniMax's F8_E4M3 + U8 weight_scale_inv layout quantizes."""
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        raw_weight = np.random.randint(0, 255, (hidden, hidden), dtype=np.uint8)
+        exponent_scales = np.full((hidden, hidden // 32), 127, dtype=np.uint8)
+        _write_safetensors(
+            str(src / "model.safetensors"),
+            {
+                "model.embed_tokens.weight": np.ones((256, hidden), dtype=np.float16),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float16
+                ),
+                "model.layers.0.self_attn.q_proj.weight": (
+                    raw_weight.tobytes(),
+                    [hidden, hidden],
+                    "F8_E4M3",
+                ),
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": (
+                    exponent_scales.tobytes(),
+                    [hidden, hidden // 32],
+                    "U8",
+                ),
+                "lm_head.weight": np.ones((256, hidden), dtype=np.float16),
+            },
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_fp8",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                    "quantization_config": {
+                        "quant_method": "mxfp8",
+                        "weight_block_size": [1, 32],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        from safetensors import safe_open
+
+        out_keys = set()
+        for shard in out.glob("*.safetensors"):
+            with safe_open(str(shard), framework="numpy") as handle:
+                out_keys.update(handle.keys())
+        assert "model.layers.0.self_attn.q_proj.scales" in out_keys
+        assert not any(key.endswith("weight_scale_inv") for key in out_keys)
+
+    def test_mxfp8_source_uses_quantized_sensitivity_path(self, tmp_path, monkeypatch):
+        from omlx import oq as oq_module
+
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=64, fp8_convention="mxfp")
+        config = json.loads((src / "config.json").read_text(encoding="utf-8"))
+        config["quantization_config"] = {"quant_method": "mxfp8"}
+        (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+        standard_measure = MagicMock(
+            side_effect=AssertionError("raw QDQ sensitivity path used")
+        )
+        quantized_measure = MagicMock(return_value={0: 0.1})
+        monkeypatch.setattr(oq_module, "_measure_sensitivity", standard_measure)
+        monkeypatch.setattr(
+            oq_module,
+            "_measure_sensitivity_from_quantized_model",
+            quantized_measure,
+        )
+
+        quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+        standard_measure.assert_not_called()
+        quantized_measure.assert_called_once()
+
     def test_no_scale_keys_in_output(self, tmp_path):
         """Scale keys are consumed by dequant, never written to output."""
         src = tmp_path / "src"
@@ -3330,8 +4163,11 @@ class TestQuantizeOqStreamingFp8:
         _make_fp8_model(src, n_layers=2, hidden=128, fp8_convention="mxfp")
         out = tmp_path / "out"
 
-        # Patch system RAM to 1 byte — any model exceeds it
-        with patch("omlx.settings.get_system_memory", return_value=1):
+        # Patch live calibration capacity to 1 byte — any model exceeds it.
+        with (
+            patch("omlx.oq._system_available_memory_bytes", return_value=1),
+            patch("omlx.oq._metal_available_memory_bytes", return_value=1),
+        ):
             quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         assert (out / "config.json").exists()
@@ -3353,7 +4189,10 @@ class TestQuantizeOqStreamingFp8:
         tmpdir = tempfile.gettempdir()
         before = set(os.listdir(tmpdir))
 
-        with patch("omlx.settings.get_system_memory", return_value=1):
+        with (
+            patch("omlx.oq._system_available_memory_bytes", return_value=1),
+            patch("omlx.oq._metal_available_memory_bytes", return_value=1),
+        ):
             quantize_oq_streaming(str(src), str(out), oq_level=4)
 
         # No new safetensors scratch files in tmp
@@ -3903,7 +4742,7 @@ class TestMeasureSensitivityVlmMtp:
 
         result = _measure_sensitivity(
             "/fake/vlm-mtp",
-            {"vision_config": {}},
+            {"vision_config": {"hidden_size": 1}},
             6,
         )
 
@@ -3918,7 +4757,7 @@ class TestMeasureSensitivityVlmMtp:
 
         _measure_sensitivity(
             "/fake/vlm-mtp",
-            {"vision_config": {}},
+            {"vision_config": {"hidden_size": 1}},
             6,
             trust_remote_code=True,
         )
@@ -3935,7 +4774,9 @@ class TestMeasureSensitivityVlmMtp:
             prev_active=prev_active,
         )
 
-        _measure_sensitivity("/fake/vlm-mtp", {"vision_config": {}}, 6)
+        _measure_sensitivity(
+            "/fake/vlm-mtp", {"vision_config": {"hidden_size": 1}}, 6
+        )
 
         assert mock_set_active.call_args_list[-1] == ((prev_active,),)
 
@@ -3946,7 +4787,9 @@ class TestMeasureSensitivityVlmMtp:
             has_mtp=False,
         )
 
-        _measure_sensitivity("/fake/vlm", {"vision_config": {}}, 6)
+        _measure_sensitivity(
+            "/fake/vlm", {"vision_config": {"hidden_size": 1}}, 6
+        )
 
         mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
@@ -3960,7 +4803,11 @@ class TestMeasureSensitivityVlmMtp:
             has_mtp_weights=False,
         )
 
-        _measure_sensitivity("/fake/vlm-mtp-config-only", {"vision_config": {}}, 6)
+        _measure_sensitivity(
+            "/fake/vlm-mtp-config-only",
+            {"vision_config": {"hidden_size": 1}},
+            6,
+        )
 
         mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
@@ -4070,7 +4917,10 @@ class TestMeasureSensitivityQuantizedVlm:
 
         result = _measure_sensitivity_from_quantized_model(
             "/fake/minimax-proxy",
-            {"vision_config": {}, "model_type": "minimax_m3_vl"},
+            {
+                "vision_config": {"hidden_size": 1},
+                "model_type": "minimax_m3_vl",
+            },
             3.5,
             trust_remote_code=True,
         )
@@ -4088,6 +4938,67 @@ class TestMeasureSensitivityQuantizedVlm:
 # =============================================================================
 # Test pre-computed sensitivity map loading (oq_sensitivity_map.json)
 # =============================================================================
+
+
+class TestMiniMaxSharedExpertLayout:
+    @pytest.fixture
+    def config(self):
+        return {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3ForConditionalGeneration"],
+            "text_config": {
+                "model_type": "minimax_m3",
+                "num_hidden_layers": 60,
+                "n_shared_experts": 1,
+            },
+        }
+
+    def test_mixed_bit_oq_forces_unpacked_shared_expert(self, config):
+        assert _configure_minimax_shared_expert_layout(config, 4)
+        assert config["text_config"]["pack_shared_expert"] is False
+
+    def test_oq8_preserves_default_packed_layout(self, config):
+        assert not _configure_minimax_shared_expert_layout(config, 8)
+        assert "pack_shared_expert" not in config["text_config"]
+
+    def test_non_minimax_model_is_unchanged(self):
+        config = {
+            "model_type": "qwen3_moe",
+            "text_config": {"num_hidden_layers": 60, "n_shared_experts": 1},
+        }
+        assert not _configure_minimax_shared_expert_layout(config, 4)
+        assert "pack_shared_expert" not in config["text_config"]
+
+    def test_mxfp8_scale_inv_passthrough_requires_minimax_source(self, config):
+        config["quantization_config"] = {"quant_method": "mxfp8"}
+        assert _uses_minimax_mxfp8_scale_inv_source(config)
+
+        config["model_type"] = "qwen3_moe"
+        config["architectures"] = ["Qwen3MoeForCausalLM"]
+        config["text_config"]["model_type"] = "qwen3_moe"
+        assert not _uses_minimax_mxfp8_scale_inv_source(config)
+
+
+class TestSensitivityMapOverride:
+    def test_normalizes_selected_front_and_back_layers(self):
+        config = {"text_config": {"num_hidden_layers": 60}}
+        selected = {idx: 1.0 for idx in (*range(7), *range(53, 60))}
+
+        assert _normalize_sensitivity_map_override(config, selected) == selected
+
+    @pytest.mark.parametrize(
+        ("override", "match"),
+        [
+            ({}, "non-empty dict"),
+            ({60: 1.0}, "outside"),
+            ({0: 0.0}, "finite and > 0"),
+            ({0: float("nan")}, "finite and > 0"),
+        ],
+    )
+    def test_rejects_invalid_override(self, override, match):
+        config = {"num_hidden_layers": 60}
+        with pytest.raises(ValueError, match=match):
+            _normalize_sensitivity_map_override(config, override)
 
 
 class TestPrecomputedSensitivityMap:
@@ -4146,6 +5057,76 @@ class TestPrecomputedSensitivityMap:
         _oq._measure_sensitivity.assert_not_called()
         _oq._measure_sensitivity_from_quantized_model.assert_not_called()
         _oq._build_proxy_for_sensitivity.assert_not_called()
+
+    def test_explicit_override_skips_cache_measurement_and_proxy(
+        self, tmp_path, monkeypatch
+    ):
+        if not HAS_MLX:
+            pytest.skip("mlx not available")
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 4,
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 8,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 256,
+                }
+            )
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"1": 99.0}), encoding="utf-8"
+        )
+
+        from omlx import oq as _oq
+
+        for name in (
+            "_measure_sensitivity",
+            "_measure_sensitivity_from_quantized_model",
+            "_build_proxy_for_sensitivity",
+        ):
+            monkeypatch.setattr(
+                _oq, name, MagicMock(side_effect=RuntimeError("should not call"))
+            )
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            sensitivity_map_override={0: 1.0, 3: 1.0},
+            auto_proxy_sensitivity=False,
+        )
+
+        for name in (
+            "_measure_sensitivity",
+            "_measure_sensitivity_from_quantized_model",
+            "_build_proxy_for_sensitivity",
+        ):
+            getattr(_oq, name).assert_not_called()
+        assert len(captured_configs) == 1
+        assert captured_configs[0]["_oq_sensitivity_map"] == {
+            "0": 1.0,
+            "3": 1.0,
+        }
 
     def test_sensitivity_map_used_in_quant_plan(self, tmp_path, monkeypatch):
         """The loaded sensitivity map is stored in config['_oq_sensitivity_map']
@@ -4390,3 +5371,768 @@ class TestQuantizeOqStreamingOq25:
         assert "model.layers.0.mlp.switch_mlp.down_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.gate_proj.scales" in tensors
         assert "model.layers.0.mlp.switch_mlp.up_proj.scales" in tensors
+
+
+class TestTextOnlyMultimodalMetadata:
+    """A text-only output must not advertise the modalities it dropped.
+
+    Text-only conversions strip the vision / audio / speech tensors, so the
+    output config and the copied sidecars must not keep claiming those
+    inputs. MiMo V2.5 spells two of them differently from the families oQ
+    saw first, carrying a top-level ``vision_model_type`` and
+    ``processor_config`` rather than only a nested ``vision_config``.
+    """
+
+    MIMO_LIKE_CONFIG = {
+        "model_type": "mimo_v2",
+        "hidden_size": 4096,
+        "num_hidden_layers": 48,
+        "vision_config": {"depth": 28},
+        "vision_model_type": "mimovl",
+        "processor_config": {"patch_size": 14},
+        "image_token_id": 151655,
+        "video_token_id": 151656,
+        "vision_start_token_id": 151652,
+        "vision_end_token_id": 151653,
+        "audio_config": {"num_layers": 24},
+    }
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "vision_config",
+            "vision_model_type",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "audio_config",
+            "processor_config",
+        ],
+    )
+    def test_multimodal_key_is_dropped(self, key):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = dict(self.MIMO_LIKE_CONFIG)
+        assert key in config, "fixture must actually carry the key under test"
+
+        _normalize_text_only_in_config(config)
+
+        assert key not in config
+
+    def test_text_keys_survive(self):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = dict(self.MIMO_LIKE_CONFIG)
+
+        _normalize_text_only_in_config(config)
+
+        assert config["model_type"] == "mimo_v2"
+        assert config["hidden_size"] == 4096
+        assert config["num_hidden_layers"] == 48
+
+    def test_absent_keys_are_not_an_error(self):
+        from omlx.oq import _normalize_text_only_in_config
+
+        config = {"model_type": "qwen3", "hidden_size": 1024}
+
+        _normalize_text_only_in_config(config)
+
+        assert config == {"model_type": "qwen3", "hidden_size": 1024}
+
+    @staticmethod
+    def _make_source(tmp_path, **contents):
+        """Build a source dir; ``contents`` overrides a file's body."""
+        src = tmp_path / "src"
+        src.mkdir()
+        files = {
+            "tokenizer.json": "{}",
+            "tokenizer_config.json": "{}",
+            "preprocessor_config.json": "{}",
+            "processor_config.json": "{}",
+        }
+        files.update(contents)
+        for name, body in files.items():
+            (src / name).write_text(body)
+        return src
+
+    def test_text_only_skips_processor_sidecars(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "tokenizer.json").exists()
+        assert (out / "tokenizer_config.json").exists()
+        assert not (out / "preprocessor_config.json").exists()
+        assert not (out / "processor_config.json").exists()
+
+    def test_multimodal_keeps_processor_sidecars(self, tmp_path):
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path)
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out)
+
+        assert (out / "preprocessor_config.json").exists()
+        assert (out / "processor_config.json").exists()
+
+    def test_text_only_keeps_processor_config_holding_a_chat_template(
+        self, tmp_path
+    ):
+        """An inline chat template is not modality metadata.
+
+        Older processor repos store the template under a ``chat_template``
+        key inside ``processor_config.json`` and Transformers still honours
+        it on load, so dropping the file would silently take the model's
+        chat template with it.
+        """
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(
+            tmp_path,
+            **{"processor_config.json": json.dumps({"chat_template": "{{ x }}"})},
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "processor_config.json").exists()
+        # The one carrying only modality settings is still dropped.
+        assert not (out / "preprocessor_config.json").exists()
+
+    def test_text_only_keeps_unparseable_processor_config(self, tmp_path):
+        """Preserving a file we cannot parse is the cheaper mistake."""
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(
+            tmp_path, **{"preprocessor_config.json": "not json at all"}
+        )
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "preprocessor_config.json").exists()
+
+    @pytest.mark.parametrize("body", ["[]", "null", '"processor"'])
+    def test_text_only_keeps_non_mapping_processor_config(self, tmp_path, body):
+        """Valid JSON with a non-object root must be preserved, not crash."""
+        from omlx.oq import _copy_model_sidecars
+
+        src = self._make_source(tmp_path, **{"processor_config.json": body})
+        out = tmp_path / "out"
+        out.mkdir()
+
+        _copy_model_sidecars(src, out, text_only=True)
+
+        assert (out / "processor_config.json").exists()
+
+    def test_processor_configs_stay_out_of_the_base_pattern_list(self):
+        """The chat-template guard only runs for the multimodal patterns.
+
+        Moving either name back into the base list would bypass the guard and
+        the text-only skip together, with no test failing on the copy paths.
+        """
+        from omlx.oq import _MULTIMODAL_SIDECAR_PATTERNS, _SIDECAR_PATTERNS
+
+        assert not set(_SIDECAR_PATTERNS) & set(_MULTIMODAL_SIDECAR_PATTERNS)
+        assert "preprocessor_config.json" in _MULTIMODAL_SIDECAR_PATTERNS
+        assert "processor_config.json" in _MULTIMODAL_SIDECAR_PATTERNS
+
+
+class TestRecorderRefusesUnreplayableOps:
+    """Discovery must refuse what replay cannot reproduce.
+
+    ``_DiscoveredPlan`` replays a list of single-source unary ops. An op
+    against a second live tensor cannot be expressed, and recording only one
+    side would silently drop the other: a block-scale multiply would vanish
+    and the plan would ship unscaled weights. The recorder therefore poisons
+    the result so discovery raises and the caller falls back to eager
+    sanitize.
+    """
+
+    class _Index:
+        def __init__(self, logical):
+            self._logical = logical
+            self._index = {}
+
+        def logical_metadata(self):
+            return self._logical
+
+    def _discover(self, sanitize_fn, logical):
+        from omlx.oq import _discover_sanitize_plan
+
+        return _discover_sanitize_plan(sanitize_fn, self._Index(logical))
+
+    def test_scale_multiply_is_not_laundered_by_later_unary_ops(self):
+        """The regression that motivated the guard.
+
+        Block-aligned shapes keep every reshape consistent, so nothing fails
+        on shape grounds and the trailing ``astype`` used to make the plan
+        look replayable while the multiply had silently disappeared.
+        """
+        logical = {"w": ((256, 128), "BF16"), "s": ((2, 1), "F32")}
+
+        def sanitize(weights):
+            w = weights["w"].reshape(2, 128, 128)
+            w = w * weights["s"][:, None, None]
+            return {"out": w.reshape(256, 128).astype(mx.bfloat16)}
+
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
+            self._discover(sanitize, logical)
+
+    def test_scale_multiply_is_not_laundered_by_split(self):
+        """A split must not turn a poisoned multi-source result replayable."""
+        logical = {"w": ((256, 128), "BF16"), "s": ((256, 1), "F32")}
+
+        def sanitize(weights):
+            scaled = weights["w"] * weights["s"]
+            return {"out": mx.split(scaled, 2, axis=0)[0]}
+
+        with pytest.raises(
+            ValueError, match="non-replayable transform|single-source transform"
+        ):
+            self._discover(sanitize, logical)
+
+    def test_scalar_multiply_still_records(self):
+        """Only a second tracked tensor poisons; scalars are unaffected."""
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        assert (tracked * 2.0).transform != "nested_unreplayable"
+        assert (tracked * tracked).transform == "nested_unreplayable"
+
+    def test_binary_op_records_both_operands_as_sources(self):
+        from omlx.oq import _TrackedTensor
+
+        left = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        right = _TrackedTensor((8, 1), "F32", sources=["s"])
+
+        assert set((left * right).sources) == {"w", "s"}
+
+    @pytest.mark.parametrize("op", ["from_fp8", "pad"])
+    def test_ops_that_reset_the_recipe_poison_instead(self, op):
+        """These built a fresh tensor with an empty recipe, discarding any
+        lineage recorded before them."""
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((256, 128), "BF16", sources=["w"])
+        reshaped = tracked.reshape(2, 128, 128)
+        assert reshaped.recipe, "precondition: something was recorded"
+
+        if op == "from_fp8":
+            result = reshaped._unreplayable(dtype="BF16")
+        else:
+            result = reshaped._unreplayable(shape=(2, 130, 128))
+
+        assert result.transform == "nested_unreplayable"
+        assert not result.recipe
+
+    def test_poison_survives_a_following_replayable_op(self):
+        from omlx.oq import _TrackedTensor
+
+        tracked = _TrackedTensor((8, 4), "BF16", sources=["w"])
+        poisoned = tracked * _TrackedTensor((8, 1), "F32", sources=["s"])
+
+        assert poisoned.reshape(4, 8).transform == "nested_unreplayable"
+        assert poisoned.astype(mx.bfloat16).transform == "nested_unreplayable"
+
+
+class TestCalibrationFootprint:
+    """Calibration materializes the dequantized view, so the proxy budget
+    must size on that rather than on the checkpoint's file bytes."""
+
+    class _FakeIndex:
+        def __init__(self, logical):
+            self._logical = logical
+
+        def logical_metadata(self):
+            return self._logical
+
+    def test_fp8_weights_are_counted_as_bf16(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        # An fp8 weight occupies one byte on disk; the logical view reports
+        # it as BF16, which is what the calibration forward allocates.
+        index = self._FakeIndex({"w": ((1000, 1000), "BF16")})
+        assert _logical_footprint_bytes(index) == 1000 * 1000 * 2
+
+    def test_packed_fp4_expands_fourfold_not_twofold(self):
+        """The case a flat 2x multiplier gets wrong.
+
+        DeepSeek-V4 style experts store two fp4 values per byte and declare
+        ``quant_method: "fp8"``. The logical view already reports the
+        unpacked column count, so one stored byte becomes two bf16 values,
+        i.e. 4 bytes -- double what a per-format constant would predict.
+        """
+        from omlx.oq import _logical_footprint_bytes
+
+        on_disk_bytes = 512 * 256
+        index = self._FakeIndex({"w": ((512, 256 * 2), "BF16")})
+        assert _logical_footprint_bytes(index) == on_disk_bytes * 4
+
+    def test_unquantized_source_is_unchanged(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        index = self._FakeIndex({"w": ((10, 10), "BF16"), "b": ((10,), "F32")})
+        assert _logical_footprint_bytes(index) == 10 * 10 * 2 + 10 * 4
+
+    def test_index_without_logical_view_contributes_nothing(self):
+        from omlx.oq import _logical_footprint_bytes
+
+        assert _logical_footprint_bytes(object()) == 0
+
+    def test_dequantized_footprint_flips_requires_proxy(self, monkeypatch):
+        import omlx.oq as oq
+
+        # Fixed capacity 400 -> model_limit = int(0.75 * 400) = 300.
+        monkeypatch.setattr(oq, "_system_available_memory_bytes", lambda: 400)
+        monkeypatch.setattr(oq, "_metal_available_memory_bytes", lambda: 400)
+
+        on_disk = 200  # < 300 -> sizing on file bytes would skip the proxy
+        assert oq._calibration_memory_budget(on_disk)["requires_proxy"] is False
+
+        # Same tensors, reported at their dequantized size.
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+        footprint = max(on_disk, oq._logical_footprint_bytes(index))
+        assert footprint == 400  # over the 300 limit
+        assert oq._calibration_memory_budget(footprint)["requires_proxy"] is True
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"quantization_config": {"quant_method": "mxfp8"}},
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+        ],
+        ids=["minimax_mxfp8", "deepseek_v4_fp4"],
+    )
+    def test_quantized_source_calibration_keeps_packed_footprint(self, config):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+
+        assert _calibration_footprint_bytes(index, 100, config) == 100
+
+    def test_native_fp8_calibration_uses_dequantized_footprint(self):
+        from omlx.oq import _calibration_footprint_bytes
+
+        index = self._FakeIndex({"w": ((200, 1), "BF16")})
+        config = {
+            "model_type": "mimo_v2",
+            "quantization_config": {"quant_method": "fp8"},
+        }
+
+        assert _calibration_footprint_bytes(index, 100, config) == 400
+
+
+# =============================================================================
+# Inkling (Thinking Machines) support
+# =============================================================================
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestInklingQuantPredicate:
+    """Predicate behavior on inkling's sanitized tensor names."""
+
+    @pytest.fixture
+    def inkling_config(self):
+        return {
+            "model_type": "inkling_mm_model",
+            "vision_config": {"patch_size": 40},
+            "audio_config": {"n_mel_bins": 80},
+            "text_config": {
+                "hidden_size": 4096,
+                "num_hidden_layers": 42,
+                "n_routed_experts": 256,
+            },
+        }
+
+    @pytest.fixture
+    def module(self):
+        return MagicMock(spec=[])
+
+    def test_sconv_conv_weights_skipped(self, inkling_config, module):
+        # nn.Conv1d has no to_quantized(); a quantized emission would break
+        # the mlx-vlm load-time class_predicate.
+        for name in (
+            "language_model.model.layers.3.self_attn.k_sconv.conv.weight",
+            "language_model.model.layers.3.self_attn.v_sconv.conv.weight",
+            "language_model.model.layers.3.attn_sconv.conv.weight",
+            "language_model.model.layers.3.mlp_sconv.conv.weight",
+        ):
+            assert (
+                universal_quant_predicate(name, module, inkling_config) is False
+            ), name
+
+    def test_routed_experts_quantized(self, inkling_config, module):
+        result = universal_quant_predicate(
+            "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight",
+            module,
+            inkling_config,
+        )
+        assert result is not False
+
+    def test_shared_experts_q8(self, inkling_config, module):
+        result = universal_quant_predicate(
+            "language_model.model.layers.3.mlp.shared_experts.gate_proj.weight",
+            module,
+            inkling_config,
+        )
+        assert isinstance(result, dict) and result["bits"] == 8
+
+    def test_fused_qkvr_keeps_inkling_attention_at_q8(
+        self, inkling_config, module
+    ):
+        result = universal_quant_predicate(
+            "language_model.model.layers.3.self_attn.qkvr_proj.weight",
+            module,
+            inkling_config,
+        )
+        assert isinstance(result, dict) and result["bits"] == 8
+
+    def test_towers_skipped(self, inkling_config, module):
+        assert (
+            universal_quant_predicate(
+                "vision_tower.encoder_layers.0.projection.weight",
+                module,
+                inkling_config,
+            )
+            is False
+        )
+        assert (
+            universal_quant_predicate(
+                "audio_tower.embed_audio_tokens.weight", module, inkling_config
+            )
+            is False
+        )
+
+    def test_router_and_scales_not_tensor_candidates(self):
+        # gate_weight / rel_proj / gate_scale lack the ".weight" suffix and
+        # never reach the predicate.
+        assert not _should_quantize_tensor(
+            "language_model.model.layers.3.mlp.gate_weight", (258, 4096)
+        )
+        assert not _should_quantize_tensor(
+            "language_model.model.layers.3.self_attn.rel_proj", (16, 1024)
+        )
+        assert not _should_quantize_tensor(
+            "language_model.model.layers.3.mlp.switch_mlp.gate_scale", (256,)
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestInklingSanitizeDiscovery:
+    """The vendored inkling sanitize must be replayable by the streaming
+    sanitize-plan discovery (expert buffering + interleaved w13 split +
+    synthesized identity scales + sconv transpose)."""
+
+    def _plan(self, tmp_path):
+        import importlib
+
+        from omlx.patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        apply_mlx_vlm_inkling_compat_patch()
+        inkling_mod = importlib.import_module("mlx_vlm.models.inkling.inkling")
+        model = inkling_mod.Model.__new__(inkling_mod.Model)
+
+        hidden, inter, n_experts = 8, 4, 2
+        tensors = {
+            "model.llm.layers.1.mlp.experts.w13_weight": np.zeros(
+                (n_experts, 2 * inter, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.mlp.experts.w2_weight": np.zeros(
+                (n_experts, hidden, inter), dtype=np.float16
+            ),
+            "model.llm.layers.1.mlp.shared_experts.shared_w13_weight": np.zeros(
+                (2, 2 * inter, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.mlp.shared_experts.shared_w2_weight": np.zeros(
+                (2, hidden, inter), dtype=np.float16
+            ),
+            "model.llm.layers.1.mlp.gate.weight": np.zeros(
+                (n_experts + 1, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.attn.wq_du.weight": np.zeros(
+                (hidden, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.attn.wk_dv.weight": np.zeros(
+                (hidden, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.attn.wv_dv.weight": np.zeros(
+                (hidden, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.attn.wr_du.weight": np.zeros(
+                (hidden, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.attn.k_sconv.weight": np.zeros(
+                (hidden, 1, 4), dtype=np.float16
+            ),
+            "model.llm.embed.weight": np.zeros((16, hidden), dtype=np.float16),
+            "model.mtp.layers.0.input_proj.weight": np.zeros(
+                (4, 4), dtype=np.float16
+            ),
+        }
+        path = tmp_path / "weights.safetensors"
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize_fn(weights):
+            return inkling_mod.Model.sanitize(model, weights)
+
+        return _discover_sanitize_plan(sanitize_fn, idx)
+
+    def test_plan_is_replayable(self, tmp_path):
+        plan = self._plan(tmp_path)
+        assert plan is not None
+
+        prefix = "language_model.model.layers.1."
+        gate = plan[prefix + "mlp.switch_mlp.gate_proj.weight"]
+        assert gate["sources"] == ["model.llm.layers.1.mlp.experts.w13_weight"]
+        assert tuple(gate["shape"]) == (2, 4, 8)
+
+        down = plan[prefix + "mlp.switch_mlp.down_proj.weight"]
+        assert down["transform"] == "passthrough"
+
+        shared_gate = plan[prefix + "mlp.shared_experts.gate_proj.weight"]
+        shared_down = plan[prefix + "mlp.shared_experts.down_proj.weight"]
+        assert tuple(shared_gate["shape"]) == (8, 8)
+        assert tuple(shared_down["shape"]) == (8, 8)
+
+        # Synthesized identity scales become literal plan entries.
+        assert plan[prefix + "mlp.switch_mlp.gate_scale"]["transform"] == "literal"
+        assert plan[prefix + "mlp.switch_mlp.out_scale"]["transform"] == "literal"
+
+        sconv = plan[prefix + "self_attn.k_sconv.conv.weight"]
+        assert tuple(sconv["shape"]) == (8, 4, 1)
+
+        qkvr = plan[prefix + "self_attn.qkvr_proj.weight"]
+        assert qkvr["sources"] == [
+            "model.llm.layers.1.attn.wq_du.weight",
+            "model.llm.layers.1.attn.wk_dv.weight",
+            "model.llm.layers.1.attn.wv_dv.weight",
+            "model.llm.layers.1.attn.wr_du.weight",
+        ]
+        assert tuple(qkvr["shape"]) == (32, 8)
+
+        assert plan["language_model.model.embed_tokens.weight"]["transform"] == (
+            "passthrough"
+        )
+        # MTP keys are either dropped (no Lightning MTP hook installed) or
+        # mapped to language_model.mtp.* (hook active, process-wide once any
+        # MTP-aware sanitize ran); raw model.mtp.* names must never leak.
+        assert not any(k.startswith("model.mtp") for k in plan)
+
+    def test_plan_materializes_interleaved_split(self, tmp_path):
+        """Replaying the discovered plan must reproduce the de-interleave
+        exactly (gate = even rows, up = odd rows of w13)."""
+        import importlib
+
+        from omlx.patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        apply_mlx_vlm_inkling_compat_patch()
+        inkling_mod = importlib.import_module("mlx_vlm.models.inkling.inkling")
+        model = inkling_mod.Model.__new__(inkling_mod.Model)
+
+        hidden, inter, n_experts = 8, 4, 2
+        w13 = (
+            np.arange(n_experts * 2 * inter * hidden)
+            .reshape(n_experts, 2 * inter, hidden)
+            .astype(np.float16)
+        )
+        tensors = {
+            "model.llm.layers.1.mlp.experts.w13_weight": w13,
+            "model.llm.layers.1.mlp.experts.w2_weight": np.ones(
+                (n_experts, hidden, inter), dtype=np.float16
+            ),
+        }
+        path = tmp_path / "weights.safetensors"
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize_fn(weights):
+            return inkling_mod.Model.sanitize(model, weights)
+
+        plan = _discover_sanitize_plan(sanitize_fn, idx)
+        materialized = _DiscoveredPlan(plan, idx)
+
+        prefix = "language_model.model.layers.1.mlp.switch_mlp."
+        gate = np.asarray(materialized.pop(prefix + "gate_proj.weight"))
+        up = np.asarray(materialized.pop(prefix + "up_proj.weight"))
+        ref = w13.reshape(n_experts, inter, 2, hidden)
+        np.testing.assert_array_equal(gate, ref[:, :, 0, :])
+        np.testing.assert_array_equal(up, ref[:, :, 1, :])
+        scale = np.asarray(materialized.pop(prefix + "gate_scale"))
+        np.testing.assert_array_equal(scale, np.ones(n_experts, dtype=np.float32))
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestInklingLayerWalk:
+    """Calibration layer-walk wiring for inkling."""
+
+    def _model(self):
+        import importlib
+
+        from omlx.patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        apply_mlx_vlm_inkling_compat_patch()
+        compat = importlib.import_module("tests.test_mlx_vlm_inkling_compat")
+        return compat._tiny_language_model()
+
+    def test_prepare_layer_inputs_uses_inkling_branch(self):
+        from types import SimpleNamespace
+
+        from omlx.oq import _prepare_layer_inputs
+
+        lm = self._model()
+        wrapper = SimpleNamespace(model_type="inkling_mm_model")
+        inputs = mx.random.normal((1, 6, 32))
+        calib = mx.zeros((1, 6), dtype=mx.int32)
+        out_inputs, masks, state = _prepare_layer_inputs(
+            wrapper, lm.model.layers, calib, inputs
+        )
+        assert out_inputs is inputs
+        assert masks == [None, None]
+        assert isinstance(state, dict) and state.get("kind") == "inkling"
+
+    def test_forward_layer_result_runs_block(self):
+        from omlx.oq import _forward_layer_result
+
+        lm = self._model()
+        inputs = mx.random.normal((1, 6, 32))
+        out, aux = _forward_layer_result(
+            lm.model.layers[0], inputs, None, {"kind": "inkling"}
+        )
+        assert out is not None
+        assert out.shape == (1, 6, 32)
+
+    def test_find_model_layers_routes_through_embed_norm(self):
+        from types import SimpleNamespace
+
+        from omlx.oq import _find_model_layers
+
+        lm = self._model()
+        vlm = SimpleNamespace(language_model=lm)
+        embed_fn, layers = _find_model_layers(vlm)
+        assert layers is lm.model.layers
+        # use_embed_norm=True checkpoints must calibrate through
+        # InklingModel.embed(), not raw embed_tokens.
+        assert embed_fn == lm.model.embed
+        tokens = mx.array([[1, 2, 3]])
+        normed = embed_fn(tokens)
+        raw = lm.model.embed_tokens(tokens)
+        assert float(mx.max(mx.abs(normed - raw))) > 0.0
+
+    def test_oqe_capture_matches_vendored_switch_children(self):
+        from omlx.oq import _OQE_SWITCH_LINEAR_CLASSES
+
+        lm = self._model()
+        sparse = lm.model.layers[1].mlp
+        assert type(sparse.switch_mlp.gate_proj).__name__ in (
+            _OQE_SWITCH_LINEAR_CLASSES
+        )
+        assert type(sparse.shared_experts.down_proj).__name__ == "Linear"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestInklingModelSanitizer:
+    def test_vlm_sanitize_chain_handles_helper_methods(self):
+        """The oQ VLM sanitize chain runs Model.sanitize on a _Proxy, and
+        inkling's sanitize calls sibling instance methods — the proxy must
+        resolve them from the model class (regression: proxy AttributeError
+        aborted proxy builds for sensitivity/imatrix)."""
+        from omlx.oq import _build_model_sanitizer
+
+        config = {
+            "model_type": "inkling_mm_model",
+            "architectures": ["InklingForConditionalGeneration"],
+            "vision_config": {"patch_size": 40},
+            "audio_config": {"n_mel_bins": 80},
+            "text_config": {"hidden_size": 8, "num_hidden_layers": 2},
+        }
+        sanitize_fn = _build_model_sanitizer(config)
+        assert sanitize_fn is not None
+
+        hidden, inter, n_experts = 8, 4, 2
+        weights = {
+            "model.llm.layers.1.mlp.experts.w13_weight": mx.zeros(
+                (n_experts, 2 * inter, hidden)
+            ),
+            "model.llm.layers.1.mlp.experts.w2_weight": mx.zeros(
+                (n_experts, hidden, inter)
+            ),
+            "model.llm.layers.1.attn.wq_du.weight": mx.zeros((hidden, hidden)),
+            "model.llm.layers.1.attn.wk_dv.weight": mx.zeros((hidden, hidden)),
+            "model.llm.layers.1.attn.wv_dv.weight": mx.zeros((hidden, hidden)),
+            "model.llm.layers.1.attn.wr_du.weight": mx.zeros((hidden, hidden)),
+            "model.llm.embed.weight": mx.zeros((16, hidden)),
+        }
+        out = sanitize_fn(weights)
+        prefix = "language_model.model.layers.1."
+        assert prefix + "mlp.switch_mlp.gate_proj.weight" in out
+        assert prefix + "self_attn.qkvr_proj.weight" in out
+        assert "language_model.model.embed_tokens.weight" in out
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestEstimateBpwPostSanitizeNames:
+    def test_inkling_style_fused_source_names_are_priced(self, tmp_path):
+        """Source names without a .weight suffix (experts.w13_weight) must
+        be priced through the sanitize plan — the raw scan treated ~97% of
+        an inkling checkpoint as fp16 passthrough (15.8 bpw)."""
+        from omlx.patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        apply_mlx_vlm_inkling_compat_patch()
+
+        src = tmp_path / "Inkling-Tiny"
+        src.mkdir()
+        hidden, inter, n_experts = 64, 64, 4
+        tensors = {
+            "model.llm.layers.1.mlp.experts.w13_weight": np.zeros(
+                (n_experts, 2 * inter, hidden), dtype=np.float16
+            ),
+            "model.llm.layers.1.mlp.experts.w2_weight": np.zeros(
+                (n_experts, hidden, inter), dtype=np.float16
+            ),
+            "model.llm.embed.weight": np.zeros((256, hidden), dtype=np.float16),
+        }
+        _write_safetensors(str(src / "weights.safetensors"), tensors)
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "inkling_mm_model",
+                    "architectures": ["InklingForConditionalGeneration"],
+                    "vision_config": {"patch_size": 40},
+                    "audio_config": {"n_mel_bins": 80},
+                    "text_config": {
+                        "hidden_size": hidden,
+                        "num_hidden_layers": 2,
+                        "n_routed_experts": n_experts,
+                    },
+                }
+            )
+        )
+
+        est = estimate_bpw_and_size(str(src), 4)
+        # Experts dominate the parameter count; a raw-name scan reports
+        # ~15-16 bpw because none of them end in ".weight".
+        assert est["effective_bpw"] < 8.0, est

@@ -25,6 +25,15 @@ final class LocalizationSmokeTests: XCTestCase {
         return bundle
     }()
 
+    private static let simplifiedChineseErrorKeys: [String] = [
+        "quant.error.cancel_failed",
+        "quant.error.load_models",
+        "quant.error.remove_failed",
+        "quant.error.start_failed",
+        "quant.upload.error.cancel_failed",
+        "quant.upload.error.remove_failed",
+    ]
+
     /// Hard-coded baseline of common.* keys → English values. Only the
     /// primitives actually used by at least one wrapped call site live here;
     /// any drift means someone touched the catalog without updating call
@@ -61,8 +70,10 @@ final class LocalizationSmokeTests: XCTestCase {
         "profile.scope.preset", "profile.detail.section.sampling",
         "bench.accuracy.header.title", "bench.accuracy.section.queue",
         "bench.throughput.header.title", "bench.throughput.section.configuration",
+        "bench.context.header.title", "bench.context.section.configuration",
         // Settings + helpers
         "settings.section.basic", "settings.advanced.experimental.section",
+        "appearance.row.menubar_icon", "appearance.row.menubar_icon.restore",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",
         "menubar.item.settings", "menubar.item.web_dashboard",
@@ -76,6 +87,23 @@ final class LocalizationSmokeTests: XCTestCase {
                                              value: key, comment: "")
             XCTAssertEqual(resolved, expected,
                            "common key \(key) resolved to \(resolved); expected \(expected)")
+        }
+    }
+
+    func testSimplifiedChineseErrorTemplatesPreserveDetails() {
+        guard let path = Bundle.main.path(forResource: "zh-Hans", ofType: "lproj"),
+              let bundle = Bundle(path: path) else {
+            XCTFail("Simplified Chinese localization bundle is missing")
+            return
+        }
+
+        for key in Self.simplifiedChineseErrorKeys {
+            let resolved = NSLocalizedString(key, bundle: bundle,
+                                             value: key, comment: "")
+            XCTAssertNotEqual(resolved, key,
+                              "zh-Hans localization for \(key) exposes its key")
+            XCTAssertTrue(resolved.contains("%@"),
+                          "zh-Hans localization for \(key) drops the error placeholder")
         }
     }
 

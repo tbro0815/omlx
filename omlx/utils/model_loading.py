@@ -80,6 +80,17 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                 variant = _VLM_TEXT_PREFIX + key
             if variant not in quant and variant not in extras:
                 extras[variant] = val
+            # Laguna router overrides: published checkpoints key the
+            # per-layer quantization spec by ``mlp.gate``, but the model's
+            # actual module-tree path is ``mlp.gate.proj`` (the router is
+            # ``LagunaTopKRouter.proj``, not ``gate`` itself).  Without the
+            # matching key, ``nn.quantize`` falls back to the global bits
+            # and builds the router at the wrong width, causing a shape
+            # mismatch during strict weight loading.
+            if key.endswith(".mlp.gate"):
+                proj_variant = key + ".proj"
+                if proj_variant not in quant and proj_variant not in extras:
+                    extras[proj_variant] = val
         if extras:
             quant.update(extras)
     return cfg
@@ -168,6 +179,50 @@ def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_bailing_hybrid_fp8_quant(cfg: dict) -> dict:
+    """Map Ling mixed FP8/MXFP4 checkpoints to MLX runtime formats.
+
+    Ling 3.0 Flash FP8 checkpoints store E4M3 weights with float32
+    ``weight_scale_inv`` tensors on a 128x128 block grid. MLX has no native
+    matmul for that layout, so the vendored model sanitizer dequantizes each
+    block and requantizes it to 8-bit affine. Declaring the matching runtime
+    quantization here makes ``mlx_lm.utils.load_model`` construct
+    ``QuantizedLinear`` modules for the generated ``scales`` sidecars.
+
+    The FP4 release keeps non-expert projections in that FP8 layout, but stores
+    routed expert projections as packed MXFP4 with E8M0 scales. Those tensors
+    already match MLX's native MXFP4 representation after a byte reinterpret,
+    so add per-module overrides for the runtime ``SwitchGLU`` paths.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if cfg.get("model_type") != "bailing_hybrid":
+        return cfg
+    if isinstance(cfg.get("quantization"), dict):
+        return cfg
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict) or qc.get("quant_method") != "fp8":
+        return cfg
+
+    quantization: dict[str, Any] = {"group_size": 64, "bits": 8}
+    if qc.get("routed_experts_quant_method") == "mxfp4":
+        group_size = int(qc.get("routed_experts_group_size", 32))
+        first_sparse_layer = int(cfg.get("first_k_dense_replace", 0))
+        num_hidden_layers = int(cfg.get("num_hidden_layers", 0))
+        expert_quantization = {
+            "group_size": group_size,
+            "bits": 4,
+            "mode": "mxfp4",
+        }
+        for layer_idx in range(first_sparse_layer, num_hidden_layers):
+            base = f"model.layers.{layer_idx}.mlp.switch_mlp"
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                quantization[f"{base}.{projection}"] = dict(expert_quantization)
+
+    cfg["quantization"] = quantization
+    return cfg
+
+
 def _patch_mlx_lm_load_config() -> None:
     """Wrap ``mlx_lm.utils.load_config`` to expand per-layer quant keys."""
     global _MLX_LM_LOAD_CONFIG_PATCHED
@@ -186,6 +241,7 @@ def _patch_mlx_lm_load_config() -> None:
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
+        normalize_bailing_hybrid_fp8_quant(cfg)
         return cfg
 
     _lu.load_config = _patched
@@ -205,6 +261,12 @@ def maybe_apply_pre_load_patches(
       ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
       declares ``model_type == "step3p7"``.
+    - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
+      ``model_type == "mimo_v2"``. The vendored model intentionally ignores
+      the base checkpoint's vision, audio, speech, and MTP weights.
+    - Ling 3.0 Flash mixed MLA/KDA model when ``config.json`` declares
+      ``model_type == "bailing_hybrid"``. The vendored module is registered
+      as ``mlx_lm.models.bailing_hybrid`` before mlx-lm resolves its classes.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -249,6 +311,13 @@ def maybe_apply_pre_load_patches(
 
     if apply_m5_gather_qmm_workaround():
         logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
+
+    # Model-independent: ArraysCache.extract lacks the None-slot guard its
+    # filter/extend/merge siblings have; early-aborted requests on
+    # CacheList(KVCache, ArraysCache) models crash without it.
+    from ..patches.arrays_cache_extract import apply_arrays_cache_extract_guard
+
+    apply_arrays_cache_extract_guard()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
@@ -311,6 +380,18 @@ def maybe_apply_pre_load_patches(
 
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    if model_type == "mimo_v2":
+        from ..patches.mimo_v2 import apply_mimo_v2_patch
+
+        if apply_mimo_v2_patch():
+            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
+
+    if model_type == "bailing_hybrid":
+        from ..patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+        if apply_bailing_hybrid_patch():
+            logger.info("Ling 3.0 Flash pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
@@ -377,6 +458,28 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type in ("inkling", "inkling_mm_model"):
+        from ..patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        if apply_mlx_vlm_inkling_compat_patch():
+            logger.info(
+                "Inkling mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "muse_glimmer":
+        from ..patches.mlx_vlm_muse_glimmer_compat import (
+            apply_mlx_vlm_muse_glimmer_compat_patch,
+        )
+
+        if apply_mlx_vlm_muse_glimmer_compat_patch():
+            logger.info(
+                "Muse Glimmer mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
@@ -419,12 +522,31 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
+            elif model_type == "gemma4":
+                # The fused multi-row verify kernel keeps gemma4 global-layer
+                # attention near-flat in L, so depths 4..8 are genuinely
+                # competitive on predictable text (26B code hit 1.89x at d4+
+                # vs 1.53x capped at 3); the controller still settles shallow
+                # on low-accept content.
+                set_mtp_depth(8)
+            elif model_type in ("inkling", "inkling_mm_model"):
+                # The checkpoint ships one MTP block per draft depth; cap
+                # the chain at the shipped depth (8 on Inkling Small).
+                mtp_cfg = config.get("mtp_config") or {}
+                set_mtp_depth(
+                    int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
+                )
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
+                backend = (
+                    "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
+                )
                 logger.info(
-                    "Native MTP patch applied for %s (model_type=%s, active)",
+                    "Speculative backend selected for %s: %s "
+                    "(model_type=%s, active)",
                     model_name,
+                    backend,
                     model_type,
                 )
             else:
@@ -597,8 +719,22 @@ def maybe_apply_pre_load_patches(
                 )
 
 
+def _has_dspark_heads(config: dict) -> bool:
+    """True for checkpoints with an embedded DSpark drafter."""
+    cfgs = (config, config.get("text_config") or {})
+    for cfg in cfgs:
+        if int(cfg.get("dspark_block_size", 0) or 0) <= 0:
+            continue
+        target_ids = cfg.get("dspark_target_layer_ids") or ()
+        if target_ids:
+            return True
+    return False
+
+
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
+    if _has_dspark_heads(config):
+        return True
     if int(config.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(config.get("num_nextn_predict_layers", 0) or 0) > 0:
@@ -607,6 +743,10 @@ def _has_mtp_heads(config: dict) -> bool:
     if int(text_cfg.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
+        return True
+    # Inkling nests the head declaration under a top-level mtp_config.
+    mtp_cfg = config.get("mtp_config") or {}
+    if int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
     return False
 
@@ -617,6 +757,26 @@ _MTP_WEIGHT_PREFIXES = (
     "model.mtp.",
     "model.language_model.mtp.",
 )
+
+
+def _nextn_weight_prefixes_from_config(config: dict) -> tuple[str, ...]:
+    """Return every supported weight prefix for native nextn layers."""
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return ()
+    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+    if n_main <= 0:
+        return ()
+    return tuple(
+        prefix
+        for i in range(n_mtp)
+        for prefix in (
+            f"model.layers.{n_main + i}.",
+            f"language_model.model.layers.{n_main + i}.",
+            f"model.language_model.layers.{n_main + i}.",
+        )
+    )
 
 
 def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
@@ -631,14 +791,7 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         config = json.loads((Path(model_path) / "config.json").read_text())
     except Exception:
         return ()
-    cfgs = (config, config.get("text_config") or {})
-    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
-    if n_mtp <= 0:
-        return ()
-    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
-    if n_main <= 0:
-        return ()
-    return tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    return _nextn_weight_prefixes_from_config(config)
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
@@ -698,9 +851,10 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa) and Nemotron-H hybrids (nemotron_h).
-    The model also has to declare MTP heads in the config; otherwise the
-    patch is a no-op.
+    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
+    Gemma 4 merged-assistant checkpoints (gemma4, VLM path only). The model
+    also has to declare MTP heads in the config; otherwise the patch is a
+    no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -712,6 +866,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "gemma4"
+        or model_type in ("inkling", "inkling_mm_model")
+        or model_type == "step3p7"
     )
 
 

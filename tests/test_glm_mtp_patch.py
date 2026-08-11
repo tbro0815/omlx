@@ -372,6 +372,7 @@ class TestIndexerFusion:
             "mode": "affine",
             "model.layers.0.self_attn.indexer.wk": dict(q8),
             "model.layers.0.self_attn.indexer.weights_proj": dict(q8),
+            "model.layers.0.self_attn.indexer.wq_b": dict(q8),
         }
         args = glm.ModelArgs.from_dict(cfg)
         model = glm.Model(args)
@@ -401,6 +402,48 @@ class TestIndexerFusion:
             hd + nh,
             4,
         )
+
+    def test_mixed_q5_q8_indexers_fail_instead_of_silent_split(self, glm):
+        q5 = {"bits": 5, "group_size": 64, "mode": "affine"}
+        q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+        cfg = dict(
+            TINY_CFG,
+            num_nextn_predict_layers=0,
+            indexer_types=["full", "full"],
+            quantization={
+                "group_size": 64,
+                "bits": 3,
+                "mode": "affine",
+                **{
+                    f"model.layers.0.self_attn.indexer.{name}": dict(q5)
+                    for name in ("wq_b", "wk", "weights_proj")
+                },
+                **{
+                    f"model.layers.1.self_attn.indexer.{name}": dict(q8)
+                    for name in ("wq_b", "wk", "weights_proj")
+                },
+            },
+        )
+        args = glm.ModelArgs.from_dict(cfg)
+        with pytest.raises(
+            ValueError,
+            match="Invalid GLM DSA indexer quantization.*5-bit",
+        ):
+            glm.Model(args)
+
+    def test_uniform_non_q8_indexers_keep_supported_split_path(self, glm):
+        cfg = dict(
+            TINY_CFG,
+            num_nextn_predict_layers=0,
+            indexer_types=["full", "full"],
+            quantization={"group_size": 64, "bits": 5, "mode": "affine"},
+        )
+        model = glm.Model(glm.ModelArgs.from_dict(cfg))
+        for layer in model.model.layers:
+            indexer = layer.self_attn.indexer
+            assert indexer.wk is not None
+            assert indexer.weights_proj is not None
+            assert indexer.wk_weights_proj is None
 
 
 class TestForward:

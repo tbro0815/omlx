@@ -582,18 +582,26 @@ private struct BasicTab: View {
                 Row(label: String(localized: "settings.basic.repetition_penalty.label",
                                   defaultValue: "Repetition Penalty",
                                   comment: "Row label for the repetition-penalty field"),
-                    sublabel: String(localized: "settings.basic.repetition_penalty.sub",
-                                     defaultValue: "Penalize repeated tokens (−2 to 2).",
-                                     comment: "Sublabel describing repetition-penalty range")) {
+                    sublabel: vm.vlmMtpEnabled
+                        ? vm.vlmMtpProcessorLockedReason
+                        : String(localized: "settings.basic.repetition_penalty.sub",
+                                 defaultValue: "Penalize repeated tokens (−2 to 2).",
+                                 comment: "Sublabel describing repetition-penalty range")) {
                     TextInput(text: vm.bindProfile($vm.repetitionPenalty), mono: true, width: 90)
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
                 Row(label: String(localized: "settings.basic.presence_penalty.label",
                                   defaultValue: "Presence Penalty",
                                   comment: "Row label for the presence-penalty field"),
-                    sublabel: String(localized: "settings.basic.presence_penalty.sub",
-                                     defaultValue: "Penalize tokens already present (−2 to 2).",
-                                     comment: "Sublabel describing presence-penalty range")) {
+                    sublabel: vm.vlmMtpEnabled
+                        ? vm.vlmMtpProcessorLockedReason
+                        : String(localized: "settings.basic.presence_penalty.sub",
+                                 defaultValue: "Penalize tokens already present (−2 to 2).",
+                                 comment: "Sublabel describing presence-penalty range")) {
                     TextInput(text: vm.bindProfile($vm.presencePenalty), mono: true, width: 90)
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
             }
             Row(
@@ -985,7 +993,12 @@ private struct EntryEditor: View {
                 Popup(
                     selection: vm.bindProfile(binding.value),
                     width: 130,
-                    options: [("low", "low"), ("medium", "medium"), ("high", "high")]
+                    options: [
+                        ("low", "low"),
+                        ("medium", "medium"),
+                        ("high", "high"),
+                        ("max", "max"),
+                    ]
                 )
                 forceCheckbox
             }

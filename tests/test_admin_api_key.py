@@ -672,8 +672,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 9981
         mock_settings.auth.api_key = "super-secret-key"
-        mock_settings.claude_code.context_scaling_enabled = True
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -742,8 +740,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -775,8 +771,6 @@ class TestStatsSecurity:
         mock_settings.server.host = "127.0.0.1"
         mock_settings.server.port = 8000
         mock_settings.auth.api_key = ""
-        mock_settings.claude_code.context_scaling_enabled = False
-        mock_settings.claude_code.target_context_size = 200000
 
         mock_metrics = MagicMock()
         mock_metrics.get_snapshot.return_value = {
@@ -1129,7 +1123,7 @@ class TestGlobalSettingsValidation:
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=-1)
 
     def test_idle_timeout_rejects_below_minimum(self):
-        # Minimum is 60s — anything smaller is not a meaningful idle window.
+        # Minimum is 60s — anything smaller (except 0) is not meaningful.
         with pytest.raises(ValidationError):
             admin_routes.GlobalSettingsRequest(idle_timeout_seconds=30)
 
@@ -1139,9 +1133,31 @@ class TestGlobalSettingsValidation:
         # model_fields_set should include it when explicitly passed.
         assert "idle_timeout_seconds" in req.model_fields_set
 
+    def test_idle_timeout_accepts_zero_as_disabled(self):
+        # 0 means "no limit" (disabled) — normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=0)
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
+    def test_idle_timeout_accepts_empty_string_as_disabled(self):
+        # Empty string from cleared textbox normalizes to None.
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds="")
+        assert req.idle_timeout_seconds is None
+        assert "idle_timeout_seconds" in req.model_fields_set
+
     def test_idle_timeout_accepts_valid_value(self):
         req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=1800)
         assert req.idle_timeout_seconds == 1800
+
+    @pytest.mark.parametrize("value", ["60", 60.0])
+    def test_idle_timeout_preserves_integer_coercion(self, value):
+        req = admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
+        assert req.idle_timeout_seconds == 60
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_idle_timeout_rejects_boolean(self, value):
+        with pytest.raises(ValidationError):
+            admin_routes.GlobalSettingsRequest(idle_timeout_seconds=value)
 
     def test_context_window_policy_rejects_negative(self):
         with pytest.raises(ValidationError):

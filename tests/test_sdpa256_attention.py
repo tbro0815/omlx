@@ -13,7 +13,10 @@ Covers (without needing the full Qwen3.6 model):
     fits, and falls back to always-tiled without headroom info.
 """
 
+import logging
 import math
+import sys
+import types
 
 import mlx.core as mx
 import pytest
@@ -248,6 +251,7 @@ def _sdpa256_provider_reset(monkeypatch):
 
     monkeypatch.setattr(sdpa256, "_HEADROOM_PROVIDER", None, raising=False)
     monkeypatch.setattr(sdpa256, "_FORCE_TILED", None, raising=False)
+    monkeypatch.setattr(sdpa256, "_TILED_ROUTE_LOGGED", set(), raising=False)
     return sdpa256
 
 
@@ -324,16 +328,83 @@ def test_parse_force_tiled_env(monkeypatch):
     assert sdpa256._parse_force_tiled_env() is False
 
 
+# --- tiled-route engagement logging (issue #2283) --------------------------
+
+
+def _tiled_log_records(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.levelname == "INFO" and "tiled" in r.getMessage()
+    ]
+
+
+def test_tiled_route_logs_once_when_no_provider(_sdpa256_provider_reset, caplog):
+    """Guard-off servers land on the tiled path silently (issue #2283); the
+    first engagement must say so at INFO, repeats must stay quiet."""
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        records = _tiled_log_records(caplog)
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert "no guard headroom provider" in msg
+        assert "OMLX_SDPA256_TILED" in msg
+        # Second engagement for the same reason: no new record.
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+        assert len(_tiled_log_records(caplog)) == 1
+
+
+def test_tiled_route_logs_headroom_numbers(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1)  # 1 byte of headroom: unfused can't fit
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "exceeds live guard headroom" in msg
+    assert "kv_len=16384" in msg
+    assert "MiB" in msg
+
+
+def test_tiled_route_logs_forced_env(_sdpa256_provider_reset, caplog, monkeypatch):
+    sdpa256 = _sdpa256_provider_reset
+    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
+    q, k, _ = _qkv(2048, 16384)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is True
+    records = _tiled_log_records(caplog)
+    assert len(records) == 1
+    assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
+
+
+def test_unfused_route_logs_nothing(_sdpa256_provider_reset, caplog):
+    sdpa256 = _sdpa256_provider_reset
+    q, k, _ = _qkv(2048, 16384)
+    owner = _HeadroomOwner(1 << 40)  # ample headroom: fast path
+    sdpa256.set_unfused_headroom_provider(owner.headroom)
+    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
+        assert sdpa256._should_route(q, k, None, "causal", None) is False
+    assert _tiled_log_records(caplog) == []
+
+
 def test_scheduler_headroom_provider_math():
     """_sdpa256_unfused_headroom mirrors the adaptive throttle target:
     hard ceiling x headroom safety, clamped by the abort cap, minus usage."""
-    from omlx.scheduler import Scheduler
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
 
     gib = 1024**3
 
     class _Fake:
         _memory_hard_limit_bytes = 0
         _memory_abort_limit_bytes = 0
+        _memory_limits_propagated = False
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
         _prefill_headroom_safety = 0.90
         _PREFILL_HEADROOM_SAFETY = 0.90
         _prefill_abort_margin = 0.95
@@ -343,7 +414,21 @@ def test_scheduler_headroom_provider_math():
             return 10 * gib
 
     fake = _Fake()
-    # No ceiling propagated yet -> negative sentinel (keep the tiled default).
+    # Nothing propagated yet: guard state is unknown, so the negative
+    # sentinel keeps the tiled default even though the flag reads False.
+    assert Scheduler._sdpa256_unfused_headroom(fake) == -1
+
+    # Enforcer has spoken and the guard is explicitly off: the user opted
+    # out of memory management, so the route gets unbounded headroom and
+    # keeps the unfused fast path (#2283).
+    fake._memory_limits_propagated = True
+    assert (
+        Scheduler._sdpa256_unfused_headroom(fake) == _SDPA256_UNBOUNDED_HEADROOM
+    )
+
+    # Guard on but the ceiling has not landed yet (startup race): stay on
+    # the memory-safe default.
+    fake._prefill_memory_guard = True
     assert Scheduler._sdpa256_unfused_headroom(fake) == -1
 
     # Throttle target binds: abort cap (100 * 0.95) > target (100 * 0.90).
@@ -353,6 +438,36 @@ def test_scheduler_headroom_provider_math():
     # Abort cap binds when lower than the throttle target.
     fake._memory_abort_limit_bytes = 80 * gib
     assert Scheduler._sdpa256_unfused_headroom(fake) == int(80 * gib * 0.95) - 10 * gib
+
+
+def test_unguarded_fast_path_logs_once(caplog):
+    """Guard-off fast routing runs without a memory ceiling, which is the
+    one state worth a breadcrumb (#2283): exactly one INFO naming the OOM
+    trade and the recovery levers, then silence."""
+    from omlx.scheduler import _SDPA256_UNBOUNDED_HEADROOM, Scheduler
+
+    class _Fake:
+        _memory_hard_limit_bytes = 0
+        _memory_limits_propagated = True
+        _prefill_memory_guard = False
+        _sdpa256_unguarded_logged = False
+
+    fake = _Fake()
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+        assert (
+            Scheduler._sdpa256_unfused_headroom(fake)
+            == _SDPA256_UNBOUNDED_HEADROOM
+        )
+    records = [
+        r for r in caplog.records if "memory guard disabled" in r.getMessage()
+    ]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "OMLX_SDPA256_TILED=1" in msg
 
 
 def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
@@ -380,3 +495,159 @@ def test_scheduler_init_registers_headroom_provider(_sdpa256_provider_reset):
     assert bound.__self__ is scheduler
     # Ceiling not propagated yet -> negative sentinel keeps the tiled default.
     assert bound() == -1
+
+
+# --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----
+
+
+def _install_fake_vlm_tree(monkeypatch):
+    """Fake mlx-vlm namespace mirroring the production import pattern:
+    ``qwen3_5.language`` copies base's SDPA reference at import time."""
+    root = types.ModuleType("mlx_vlm")
+    models = types.ModuleType("mlx_vlm.models")
+    base = types.ModuleType("mlx_vlm.models.base")
+    language = types.ModuleType("mlx_vlm.models.qwen3_5.language")
+
+    calls = {"vlm_orig": 0}
+
+    def original(q, k, v, cache, scale, mask=None, sinks=None):
+        calls["vlm_orig"] += 1
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+    base.scaled_dot_product_attention = original
+    language.scaled_dot_product_attention = original
+    root.models = models
+    models.base = base
+
+    for name, module in {
+        "mlx_vlm": root,
+        "mlx_vlm.models": models,
+        "mlx_vlm.models.base": base,
+        "mlx_vlm.models.qwen3_5.language": language,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return base, language, original, calls
+
+
+def _snapshot_lm_sdpa():
+    snap = {}
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith("mlx_lm.models."):
+            continue
+        fn = getattr(mod, "scaled_dot_product_attention", None)
+        if fn is not None:
+            snap[name] = fn
+    return snap
+
+
+def _restore_lm_sdpa(snap):
+    for name, fn in snap.items():
+        mod = sys.modules.get(name)
+        if mod is not None:
+            mod.scaled_dot_product_attention = fn
+
+
+def test_vlm_submodule_rebind_covers_copied_reference(
+    _sdpa256_provider_reset, monkeypatch
+):
+    """The patch must rebind mlx-vlm model modules that copied base's SDPA at
+    import time — assigning to mlx_vlm.models.base alone never reaches them."""
+    sdpa256 = _sdpa256_provider_reset
+    base, language, original, calls = _install_fake_vlm_tree(monkeypatch)
+    monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 512, raising=False)
+
+    flash_calls = {"n": 0}
+    real_flash = sdpa256._flash_sdpa256
+
+    def counting_flash(q, k, v, scale, mask):
+        flash_calls["n"] += 1
+        return real_flash(q, k, v, scale, mask)
+
+    monkeypatch.setattr(sdpa256, "_flash_sdpa256", counting_flash)
+
+    lm_snap = _snapshot_lm_sdpa()
+    try:
+        assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=512) is True
+        assert language.scaled_dot_product_attention is not original
+        assert (
+            base.scaled_dot_product_attention
+            is language.scaled_dot_product_attention
+        )
+
+        # Routed shape through the module the VLM model actually calls.
+        q, k, v = _qkv(128, 512)
+        mx.eval(language.scaled_dot_product_attention(q, k, v, None, SCALE_256, "causal"))
+        assert flash_calls["n"] == 1
+
+        # Decode shape passes through to the mlx-vlm original, not mlx-lm's.
+        qd, kd, vd = _qkv(1, 512)
+        mx.eval(language.scaled_dot_product_attention(qd, kd, vd, None, SCALE_256, "causal"))
+        assert calls["vlm_orig"] == 1
+    finally:
+        _restore_lm_sdpa(lm_snap)
+        from omlx import memory_monitor as mm
+
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
+def test_production_install_order_covers_vlm_language(
+    _sdpa256_provider_reset, monkeypatch
+):
+    """Both engines install sdpa256 first and fa256 second. fa256 captures
+    whatever mlx_vlm.models.base holds at that point as its "original", so
+    sdpa256 must have already rebound the submodules — otherwise the identity
+    sweep misses qwen3_5.language and the VLM engine keeps the unfused path
+    (the baseline defect this suite pins)."""
+    sdpa256 = _sdpa256_provider_reset
+    import omlx.patches.qwen35_fa256_attention as fa256
+
+    base, language, original, calls = _install_fake_vlm_tree(monkeypatch)
+    monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(sdpa256, "_SDPA256_MIN_KV_LEN", 512, raising=False)
+    monkeypatch.setattr(fa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(fa256, "is_nax_available", lambda: False)
+    monkeypatch.setattr(fa256, "_auto_dispatch_budget", lambda *a, **k: 0)
+    monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
+
+    steel_calls = {"n": 0}
+
+    def fake_kernel(q, k, v, scale, causal=True, **kwargs):
+        steel_calls["n"] += 1
+        return q
+
+    monkeypatch.setattr(fa256, "_native_kernel", lambda: fake_kernel)
+
+    lm_snap = _snapshot_lm_sdpa()
+    try:
+        assert sdpa256.apply_sdpa256_attention_patch(min_kv_len=512) is True
+        assert fa256.apply_qwen35_fa256_attention_patch(min_kv_len=512) is True
+
+        # qwen3_5.language must have been carried through both rebinds.
+        assert language.scaled_dot_product_attention is not original
+        assert (
+            language.scaled_dot_product_attention
+            is base.scaled_dot_product_attention
+        )
+
+        # Steel-eligible prefill through the VLM call site hits the kernel.
+        q, k, v = _qkv(128, 2048, dtype=mx.bfloat16)
+        out = language.scaled_dot_product_attention(
+            q, k, v, None, SCALE_256, "causal"
+        )
+        mx.eval(out)
+        assert steel_calls["n"] == 1
+
+        # Decode still reaches the true mlx-vlm original at the chain's end.
+        qd, kd, vd = _qkv(1, 2048, dtype=mx.bfloat16)
+        mx.eval(
+            language.scaled_dot_product_attention(
+                qd, kd, vd, None, SCALE_256, "causal"
+            )
+        )
+        assert calls["vlm_orig"] == 1
+    finally:
+        _restore_lm_sdpa(lm_snap)
+        from omlx import memory_monitor as mm
+
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)

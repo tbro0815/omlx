@@ -5,6 +5,8 @@
 
 #include "dsa_indexer.h"
 #include "deepseek_v4_sparse_attention.h"
+#include "dspark_gemm.h"
+#include "dspark_qmv.h"
 #include "exact_block_attention.h"
 #include "fused_moe.h"
 #include "sparse_mla.h"
@@ -37,6 +39,8 @@ NB_MODULE(_ext, m) {
       "unused_causal_prefix_topk"_a = 0,
       "skip_causal_future_store"_a = false,
       "causal_q_offset"_a = -1,
+      "mask_ratio"_a = 0,
+      "mask_q_offset"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "dsa_topk_indices",
@@ -46,6 +50,21 @@ NB_MODULE(_ext, m) {
       "bucketed"_a = false,
       "causal_valid_prefix"_a = false,
       "stream"_a = nb::none());
+  m.def(
+      "dspark_fp32_topk_indices",
+      &omlx::glm_kernels::dspark_fp32_topk_indices,
+      "scores"_a,
+      "topk"_a = 512,
+      "stream"_a = nb::none());
+  m.def(
+      "dsa_decode_scores",
+      &omlx::glm_kernels::dsa_decode_scores,
+      "queries"_a,
+      "keys"_a,
+      "weights"_a,
+      "fp32_scores"_a = false,
+      "stream"_a = nb::none());
+
   m.def(
       "glm_dsa_sparse_mla_attention",
       &omlx::glm_kernels::glm_dsa_sparse_mla_attention,
@@ -71,6 +90,30 @@ NB_MODULE(_ext, m) {
       "block_token_mask"_a,
       "scale"_a,
       "causal"_a = true,
+      "stream"_a = nb::none());
+  m.def(
+      "dspark_rowwise_gemm",
+      &omlx::glm_kernels::dspark_rowwise_gemm,
+      "lhs"_a,
+      "rhs"_a,
+      "transpose_rhs"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "dspark_ring_gemm",
+      &omlx::glm_kernels::dspark_ring_gemm,
+      "lhs"_a,
+      "source"_a,
+      "indices"_a,
+      "transpose_rhs"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "dspark_exact_mxfp8_qmv_pair",
+      &omlx::glm_kernels::dspark_exact_mxfp8_qmv_pair,
+      "input"_a,
+      "weight_a"_a,
+      "scales_a"_a,
+      "weight_b"_a,
+      "scales_b"_a,
       "stream"_a = nb::none());
   m.def(
       "deepseek_v4_sparse_attention",

@@ -56,6 +56,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
 
@@ -142,6 +143,30 @@ def _read_config_model_type(model_path: str | Path) -> str | None:
         return None
     model_type = data.get("model_type")
     return model_type if isinstance(model_type, str) else None
+
+
+def _is_missing_chat_template_error(exc: ValueError) -> bool:
+    """True when apply_chat_template failed because no chat template is set.
+
+    transformers raises ValueError both for a missing template and for real
+    render errors (e.g. continue_final_message combined with
+    add_generation_prompt). Only the missing-template case may fall back to
+    mlx-vlm's plain rendering; anything else must propagate. Both the
+    tokenizer and the processor spellings must match: the vision render
+    prefers the processor's apply_chat_template, the counting render uses
+    the tokenizer.
+    """
+    message = str(exc)
+    return (
+        # tokenizer wording (transformers tokenizers; the pair mlx-vlm's
+        # prompt_utils._missing_template_error also matches)
+        "chat_template is not set" in message
+        or "no template argument was passed" in message
+        # processor wording (transformers ProcessorMixin; mlx-vlm processors
+        # that render their own template, e.g. phi3_v)
+        or "does not have a chat template" in message
+        or "No chat template found" in message
+    )
 
 
 def _apply_minimax_m3_thinking_mode(
@@ -1083,16 +1108,27 @@ _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
 
+def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
+    """Resolve the explicit MiniMax shared-expert layout override."""
+    configured = getattr(args, "pack_shared_expert", None)
+    if configured is not None:
+        return bool(configured)
+    return bool(
+        args.n_shared_experts == 1
+        and args.shared_intermediate_size == args.intermediate_size
+    )
+
+
 @contextlib.contextmanager
 def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
 
     mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
-    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
-    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
-    the unpacked MoE layout, so strict loading sees those tensors as unknown.
-    Hide only the safetensors ``format=mlx`` metadata during this load so the
-    upstream sanitize path runs before quantization and load_weights.
+    ``switch_mlp`` when ``Model.sanitize`` runs. MLX-format checkpoints skip
+    sanitize upstream, while MiniMax checkpoints can carry either packed or
+    explicitly unpacked mixed-bit MoE weights. Hide only the safetensors
+    ``format=mlx`` metadata during this load so the configured sanitize path
+    runs before quantization and load_weights.
     """
     if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
         yield
@@ -1143,11 +1179,7 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
         return handle
 
     def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
-        pack_shared = (
-            args.n_shared_experts == 1
-            and args.shared_intermediate_size == args.intermediate_size
-        )
-        if not pack_shared:
+        if not _should_pack_minimax_m3_shared_expert(args):
             return 0
 
         packed = 0
@@ -1547,19 +1579,16 @@ class VLMBatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
     ) -> None:
-        eviction_request = scheduler.preflight_eviction_request(
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-        )
-        if eviction_request is not None and self._prefill_eviction_callback is not None:
-            logger.info(
-                "Running preflight LRU eviction for request %s",
-                eviction_request.request_id,
-            )
-            await self._prefill_eviction_callback(eviction_request)
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_prompt_tokens,
-            request_id=request_id,
+            eviction_callback=self._prefill_eviction_callback,
+            executor=getattr(
+                getattr(getattr(self, "_engine", None), "engine", None),
+                "_mlx_executor",
+                None,
+            ),
         )
 
     @property
@@ -1784,6 +1813,30 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+
+        if self.model_type == "unlimited-ocr":
+            from ..utils.tokenizer import (
+                create_streaming_detokenizer,
+                repair_misconverted_unlimited_ocr_tokenizer,
+            )
+
+            tokenizer_obj = getattr(self._processor, "tokenizer", self._processor)
+            if repair_misconverted_unlimited_ocr_tokenizer(
+                tokenizer_obj,
+                model_path=self._model_name,
+            ):
+                # mlx-vlm also keeps a processor-level detokenizer for its own
+                # generation helpers.  Replace that stale SPM instance even
+                # though oMLX's scheduler creates fresh request-local copies.
+                self._processor.detokenizer = create_streaming_detokenizer(
+                    tokenizer_obj,
+                    model_path=self._model_name,
+                )
+                logger.warning(
+                    "Repaired misconverted Unlimited-OCR tokenizer metadata "
+                    "in memory for %s",
+                    self._model_name,
+                )
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
@@ -2678,6 +2731,7 @@ class VLMBatchedEngine(BaseEngine):
         audio: list | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
+        is_partial: bool | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -2697,6 +2751,10 @@ class VLMBatchedEngine(BaseEngine):
             messages: Chat messages (text-only, media already extracted)
             images: List of PIL Image objects
             audio: List of audio data (BytesIO buffers, tuples, or numpy arrays)
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — the server has already decided.  ``None``
+                (default) — auto-detect from ``messages`` for direct engine
+                callers.
 
         Returns:
             Tuple of (
@@ -2783,12 +2841,20 @@ class VLMBatchedEngine(BaseEngine):
                 if image_count > 0:
                     image_message_ranges.append((idx, image_count))
 
-        # Strip partial field from messages (VLM always uses add_generation_prompt=True)
+        if is_partial is None:
+            # get_message_json() keeps only (role, content), so the flag has to
+            # be read from the pre-format messages for direct engine callers.
+            is_partial = detect_and_strip_partial(messages)
+        # Tool and reasoning_content turns are appended verbatim by
+        # _format_messages_for_vlm_template(), so a residual key can survive
+        # formatting; the chat template must never see the non-standard field.
         detect_and_strip_partial(formatted_messages)
         template_kwargs = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": not is_partial,
         }
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
         if self._enable_thinking is not None:
             template_kwargs["enable_thinking"] = self._enable_thinking
         # Per-model/request kwargs override global defaults (e.g. enable_thinking,
@@ -2816,7 +2882,9 @@ class VLMBatchedEngine(BaseEngine):
             prompt = template_target.apply_chat_template(
                 formatted_messages, **template_kwargs
             )
-        except ValueError:
+        except ValueError as exc:
+            if not _is_missing_chat_template_error(exc):
+                raise
             # Processor/tokenizer has apply_chat_template but no chat_template
             # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
             # chat template at all. mlx-vlm's get_chat_template handles this by
@@ -2826,6 +2894,17 @@ class VLMBatchedEngine(BaseEngine):
             # plain rendering, so it subsumes the tokenizer fallback too.
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("add_generation_prompt", None)
+            # get_chat_template() has no continue_final_message equivalent, so
+            # partial mode cannot be honoured on this fallback. Drop the kwarg
+            # and say so rather than passing it through as an unknown argument.
+            template_kwargs.pop("continue_final_message", None)
+            if is_partial:
+                logger.warning(
+                    "Partial mode requested but %s exposes no chat template; "
+                    "mlx-vlm plain rendering always starts a new assistant "
+                    "turn, so the final message will not be continued.",
+                    self._model_name,
+                )
             prompt = get_chat_template(
                 self._processor,
                 formatted_messages,
@@ -3096,21 +3175,26 @@ class VLMBatchedEngine(BaseEngine):
         """Apply chat template for text-only messages (no images).
 
         Args:
-            is_partial: Accepted for API parity with BatchedEngine but not
-                acted upon — VLM always uses ``add_generation_prompt=True``.
-                The ``partial`` key is still cleaned from message dicts.
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — the server has already decided; the
+                ``partial`` key is cleaned from message dicts but no detection
+                is performed.  ``None`` (default) — auto-detect from messages
+                for direct engine callers.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
-            # Strip partial field (VLM always uses add_generation_prompt=True)
             if is_partial is None:
-                detect_and_strip_partial(messages)
+                is_partial = detect_and_strip_partial(messages)
             else:
+                # Server already resolved partial; just clean residual keys
+                # so the chat template never sees the non-standard field.
                 for msg in messages:
                     msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
-                "add_generation_prompt": True,
+                "add_generation_prompt": not is_partial,
             }
+            if is_partial:
+                template_kwargs["continue_final_message"] = True
             if tools:
                 template_kwargs["tools"] = tools
             if self._enable_thinking is not None:
@@ -3128,12 +3212,22 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs.pop("tools", None)
                 template_kwargs.pop("enable_thinking", None)
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
-            except ValueError:
+            except ValueError as exc:
+                if not _is_missing_chat_template_error(exc):
+                    raise
                 # Tokenizer exposes apply_chat_template but has no chat_template
                 # set (e.g. raw baidu/Unlimited-OCR ships none). Fall back to
                 # mlx-vlm's plain-message rendering, matching the vision path.
                 from mlx_vlm.prompt_utils import get_chat_template
 
+                if is_partial:
+                    logger.warning(
+                        "Partial mode requested but %s exposes no chat "
+                        "template; mlx-vlm plain rendering always starts a "
+                        "new assistant turn, so the final message will not "
+                        "be continued.",
+                        self._model_name,
+                    )
                 return get_chat_template(
                     self._processor,
                     messages,
@@ -3142,6 +3236,70 @@ class VLMBatchedEngine(BaseEngine):
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
+
+    @staticmethod
+    def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop SpecPrefill per-request overrides out of ``kwargs``.
+
+        The engine's ``add_request`` accepts these as dedicated arguments, so
+        they must be forwarded explicitly rather than left in ``**kwargs``.
+        Shared by ``generate`` and ``stream_generate`` so both request paths
+        honour SpecPrefill overrides identically.
+        """
+        specprefill_kwargs: dict[str, Any] = {}
+        for key in (
+            "specprefill",
+            "specprefill_keep_pct",
+            "specprefill_threshold",
+            "specprefill_system_end",
+        ):
+            if kwargs.get(key) is not None:
+                specprefill_kwargs[key] = kwargs.pop(key)
+        return specprefill_kwargs
+
+    def _inject_specprefill_system_end(
+        self,
+        messages: list[dict[str, Any]],
+        prompt: str | list[int],
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Compute the system-prompt token boundary and add it to ``kwargs``.
+
+        SpecPrefill protects the system-prompt region from token dropping. The
+        boundary is derived by subtracting the non-system prompt token count
+        from the full prompt token count (system-only messages usually can't be
+        templated on their own). Shared by ``chat`` and ``stream_chat`` so the
+        non-streaming path protects the system prompt identically. No-op unless
+        the model has SpecPrefill enabled and the request has a system prompt.
+
+        ``prompt`` is the already-tokenized VLM prompt (a list of token IDs,
+        per ``_process_chat_messages``), so the full-prompt count is just its
+        length rather than a re-encode.
+        """
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
+        if not (specprefill_model_enabled and kwargs.get("specprefill") is not False):
+            return
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) < len(messages) and non_system:
+            try:
+                non_system_prompt = self._tokenizer.apply_chat_template(
+                    non_system,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                full_tokens = len(prompt)
+                non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+                system_end = full_tokens - non_system_tokens
+                if system_end > 0:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
     async def generate(
         self,
@@ -3212,12 +3370,17 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
         )
+
+        # SpecPrefill: forward per-request overrides to the engine, mirroring
+        # stream_generate so the non-streaming path is not silently ignored.
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3227,6 +3390,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -3316,6 +3480,7 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
             stop_token_ids=extra_stop_ids or None,
             thinking_budget=kwargs.get("thinking_budget", None),
@@ -3324,21 +3489,7 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         # SpecPrefill: pass per-request overrides
-        specprefill_kwargs = {}
-        if kwargs.get("specprefill") is not None:
-            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
-        if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
-                "specprefill_keep_pct"
-            )
-        if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
-                "specprefill_threshold"
-            )
-        if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
-                "specprefill_system_end"
-            )
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3349,6 +3500,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             **specprefill_kwargs,
         )
 
@@ -3438,6 +3590,9 @@ class VLMBatchedEngine(BaseEngine):
             tools,
             kwargs,
         )
+
+        # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
+        self._inject_specprefill_system_end(messages, prompt, kwargs)
 
         return await self.generate(
             prompt=prompt,
@@ -3655,32 +3810,8 @@ class VLMBatchedEngine(BaseEngine):
             kwargs,
         )
 
-        # SpecPrefill: compute system prompt token count for protection.
-        # Can't template system-only messages (most templates require user),
-        # so compute by subtracting non-system from full prompt tokens.
-        specprefill_model_enabled = (
-            getattr(self._model_settings, "specprefill_enabled", False)
-            if self._model_settings
-            else False
-        )
-        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [
-                m for m in messages if m.get("role") not in ("system", "developer")
-            ]
-            if len(non_system) < len(messages) and non_system:
-                try:
-                    non_system_prompt = self._tokenizer.apply_chat_template(
-                        non_system,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    full_tokens = len(prompt)
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
-                        kwargs["specprefill_system_end"] = system_end
-                except Exception as e:
-                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+        # SpecPrefill: protect the system-prompt region from token dropping.
+        self._inject_specprefill_system_end(messages, prompt, kwargs)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -3773,6 +3904,7 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        partial = kwargs.pop("is_partial", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -3792,6 +3924,7 @@ class VLMBatchedEngine(BaseEngine):
             audio=audio if audio else None,
             chat_template_kwargs=ct_kwargs,
             tools=template_tools,
+            is_partial=partial,
         )
 
         if images:
