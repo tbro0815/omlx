@@ -190,6 +190,7 @@ from .exceptions import (
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
 )
+from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)
@@ -408,6 +409,16 @@ async def lifespan(app: FastAPI):
         _server_state.engine_pool._process_memory_enforcer = enforcer
         # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
+        # Best-effort fallback so model-swap eviction keeps working when
+        # the memory guard is disabled (#2290).
+        _server_state.engine_pool._get_admission_ceiling = (
+            enforcer.get_admission_ceiling
+        )
+        # Pre-load eviction targets the soft watermark so idle models are
+        # unloaded before the new weights allocate (#2319).
+        _server_state.engine_pool._get_admission_soft_target = (
+            enforcer.get_admission_soft_target
+        )
         enforcer.start()
 
     # Startup: Preload pinned models in the background so uvicorn binds the
@@ -772,6 +783,7 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
         request.method,
         request.url.path,
         exc,
+        exc_info=exc,
     )
     if _is_api_route(request):
         content = _openai_error_body("Internal server error", 500)
@@ -3053,6 +3065,10 @@ async def create_completion(
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
 
+            # First prompt's first-token timestamp only: later prompts start
+            # after earlier generations, so their first_token_at would count
+            # prior generation time as prefill.
+            first_token_at = None
             for i, prompt in enumerate(prompts):
                 output = await engine.generate(
                     prompt=prompt,
@@ -3070,6 +3086,8 @@ async def create_completion(
                     seed=request.seed,
                     **gen_kwargs,
                 )
+                if i == 0:
+                    first_token_at = getattr(output, "first_token_at", None)
 
                 choices.append(
                     CompletionChoice(
@@ -3088,11 +3106,18 @@ async def create_completion(
                 f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 cached_tokens=total_cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolve_model_id(request.model) or request.model,
             )
 
@@ -3188,8 +3213,6 @@ async def create_chat_completion(
 
         # Get per-model settings
         max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
         reasoning_parser = None
         settings_guided_grammar = None
         ms = get_model_settings_for_request(request.model)
@@ -3197,20 +3220,10 @@ async def create_chat_completion(
             max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
             settings_guided_grammar = _settings_guided_grammar(ms)
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -3554,10 +3567,18 @@ async def create_chat_completion(
                 f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
                 f"request_max_tokens={request.max_tokens}"
             )
+            first_token_at = getattr(output, "first_token_at", None)
+            ttft = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                generation_duration=elapsed,
+                prefill_duration=ttft,
+                generation_duration=gen_duration,
             )
 
             get_server_metrics().record_request_complete(
@@ -5105,25 +5126,14 @@ async def create_anthropic_message(
 
         # Get per-model settings
         max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
         ms = get_model_settings_for_request(request.model)
         if ms:
             max_tool_result_tokens = ms.max_tool_result_tokens
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
+        forced_keys = forced_ct_keys(ms)
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
@@ -5133,6 +5143,8 @@ async def create_anthropic_message(
                     merged_ct_kwargs["enable_thinking"] = True
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
+
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -5145,7 +5157,6 @@ async def create_anthropic_message(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -5377,11 +5388,19 @@ async def create_anthropic_message(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
@@ -5636,19 +5655,16 @@ async def create_response(
             )
 
         # Get per-model settings
-        merged_ct_kwargs = {}
         reasoning_parser = None
         ms = get_model_settings_for_request(request.model)
         if ms:
             reasoning_parser = ms.reasoning_parser
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            request.chat_template_kwargs,
+        )
+
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already
@@ -5791,7 +5807,6 @@ async def create_response(
         # Auto-set preserve_thinking only when the template advertises support
         # for it (Qwen 3.6+). Gated on detection so other templates don't
         # receive an unknown kwarg.
-        _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
         if (
             native_reasoning
@@ -5864,11 +5879,19 @@ async def create_response(
                 f"({tokens_per_sec:.1f} tok/s)"
             )
 
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 cached_tokens=output.cached_tokens,
-                generation_duration=elapsed,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
                 model_id=resolved_model,
             )
 
@@ -6719,13 +6742,11 @@ Examples:
     # Multi-model serving
     python -m omlx.server --model-dir /path/to/models
 
-    # With pinned models
-    python -m omlx.server --model-dir /path/to/models --pin llama-3b,qwen-7b
-
     # With MCP tools
     python -m omlx.server --model-dir /path/to/models --mcp-config mcp.json
 
-Note: Use the omlx CLI for full feature support.
+Note: Use the omlx CLI for full feature support. Pinned models, default
+model and sampling defaults are managed via the admin page.
         """,
     )
     parser.add_argument(
@@ -6733,18 +6754,6 @@ Note: Use the omlx CLI for full feature support.
         type=str,
         required=True,
         help="Directory containing model subdirectories",
-    )
-    parser.add_argument(
-        "--pin",
-        type=str,
-        default=None,
-        help="Comma-separated model names to keep always loaded",
-    )
-    parser.add_argument(
-        "--default-model",
-        type=str,
-        default=None,
-        help="Default model when not specified in request",
     )
     parser.add_argument(
         "--host",
@@ -6764,12 +6773,6 @@ Note: Use the omlx CLI for full feature support.
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
     )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Default max tokens for generation",
-    )
 
     args = parser.parse_args()
 
@@ -6777,14 +6780,33 @@ Note: Use the omlx CLI for full feature support.
     if args.mcp_config:
         os.environ["OMLX_MCP_CONFIG"] = args.mcp_config
 
-    # Parse pinned models
-    pinned_models = args.pin.split(",") if args.pin else []
+    # Load settings and hand them to init_server the way the omlx CLI
+    # does. The admin page resolves settings through
+    # _server_state.global_settings, so booting without them leaves
+    # _get_global_settings() returning None and the initial API-key
+    # setup form crashing with a 500 (#2282). Passing api_key keeps the
+    # two entry points enforcing the same auth. Scheduler/cache wiring
+    # stays CLI-only on purpose; this entry point remains minimal.
+    from .settings import init_settings
+
+    settings = init_settings()
+    settings.ensure_directories()
+
+    # Match the cli.py launcher: keep freed GPU buffers in the pool so
+    # allocator::free() never releases a buffer the GPU may still be
+    # using (kernel panics on M4 otherwise; see cli.py and issue #300).
+    # EnginePool eviction also assumes this cache limit is in place.
+    import mlx.core as mx
+
+    total_mem = mx.device_info().get("memory_size", 0)
+    if total_mem > 0:
+        mx.set_cache_limit(total_mem)
+
     # Initialize server
     init_server(
-        model_dir=args.model_dir,
-        pinned_models=pinned_models,
-        default_model=args.default_model,
-        max_tokens=args.max_tokens,
+        model_dirs=args.model_dir,
+        api_key=settings.auth.api_key,
+        global_settings=settings,
     )
 
     # Start server
@@ -6794,4 +6816,15 @@ Note: Use the omlx CLI for full feature support.
 
 
 if __name__ == "__main__":
+    # ``python -m omlx.server`` executes this file as the ``__main__``
+    # module, but the admin routes import it back as ``omlx.server`` at
+    # request time. Without this alias that import executes the module a
+    # SECOND time, and the fresh copy's module-level set_admin_getters()
+    # call repoints the admin state getters at a server state that
+    # init_server() never touched, so the settings main() wires in are
+    # invisible to /admin (#2282). Alias the canonical name to this
+    # instance so every later import resolves to the running server.
+    import sys
+
+    sys.modules.setdefault("omlx.server", sys.modules[__name__])
     main()

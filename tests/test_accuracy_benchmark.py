@@ -2,16 +2,20 @@
 """Unit tests for accuracy benchmark orchestration."""
 
 import asyncio
+import contextlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import omlx.admin.accuracy_benchmark as accuracy_benchmark
 from omlx.admin.accuracy_benchmark import (
     VALID_BENCHMARKS,
     AccuracyBenchmarkRequest,
     AccuracyBenchmarkRun,
     _accumulated_results,
     add_to_queue,
+    cancel_queue,
     cleanup_old_runs,
     create_run,
     get_accumulated_results,
@@ -19,6 +23,7 @@ from omlx.admin.accuracy_benchmark import (
     get_run,
     reset_accumulated_results,
     run_accuracy_benchmark,
+    start_next_from_queue,
 )
 from omlx.model_settings import ModelSettings
 
@@ -491,3 +496,306 @@ class TestExternalAccuracyRun:
         error_events = [e for e in run.events if e["type"] == "error"]
         assert error_events
         mock_client.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_external_result_separates_failures_from_wrong_answers(self):
+        questions = [
+            SimpleNamespace(
+                question_id=str(index),
+                correct=status == "correct",
+                expected="A",
+                predicted="A" if status == "correct" else "",
+                question_text="question",
+                raw_response="answer",
+                category="test",
+                time_seconds=0.1,
+                status=status,
+                finish_reason="stop",
+                reasoning_fields_present=[],
+                reasoning_fields_nonempty=[],
+                prompt_tokens=10,
+                completion_tokens=1,
+                error_message="timed out" if status == "timeout" else "",
+            )
+            for index, status in enumerate(
+                ["correct", "wrong", "parse_error", "timeout"]
+            )
+        ]
+        mock_result = MagicMock(
+            benchmark_name="mmlu",
+            accuracy=0.25,
+            total_questions=4,
+            correct_count=1,
+            time_seconds=0.4,
+            category_scores=None,
+            thinking_used=False,
+            question_results=questions,
+        )
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=mock_result)
+        mock_adapter = MagicMock()
+        mock_adapter.preflight = AsyncMock()
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+        run = create_run(self._external_request())
+
+        with (
+            patch.dict(
+                "omlx.eval.BENCHMARKS",
+                {"mmlu": MagicMock(return_value=mock_evaluator)},
+                clear=True,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalAPIClient",
+                return_value=mock_client,
+            ),
+            patch(
+                "omlx.admin.accuracy_benchmark.ExternalChatAdapter",
+                return_value=mock_adapter,
+            ),
+        ):
+            await run_accuracy_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["valid_response_count"] == 2
+        assert result["valid_response_rate"] == 0.5
+        assert result["valid_answer_accuracy"] == 0.5
+        assert result["wrong_count"] == 1
+        assert result["parse_error_count"] == 1
+        assert result["timeout_count"] == 1
+        assert result["reliability_warning"] is True
+        assert result["question_results"][3]["status"] == "timeout"
+        reset_accumulated_results()
+
+
+class _StubResult:
+    """Minimal stand-in for an eval BenchmarkResult."""
+
+    def __init__(self):
+        self.benchmark_name = "mmlu"
+        self.accuracy = 1.0
+        self.total_questions = 1
+        self.correct_count = 1
+        self.time_seconds = 0.0
+        self.question_results = []
+        self.category_scores = None
+        self.thinking_used = False
+
+
+class _StubEnginePool:
+    """Engine pool stub that tracks which model engines are loaded."""
+
+    def __init__(self):
+        self._suppress_ttl = False
+        self._settings_manager = None
+        self.loaded: list[str] = []
+
+    def get_loaded_model_ids(self):
+        return list(self.loaded)
+
+    async def _unload_engine(self, model_id):
+        if model_id in self.loaded:
+            self.loaded.remove(model_id)
+
+    async def get_engine(self, model_id, force_lm=False):
+        self.loaded.append(model_id)
+        return SimpleNamespace(model_id=model_id)
+
+
+class TestQueueChainOwnership:
+    """Regression tests for the cancel→re-add queue race (issue 1655).
+
+    Runs started by _continue_queue used to have task=None, so cancel_queue
+    could only soft-cancel them; the orphaned chain's trailing
+    _continue_queue then popped the NEW queue and ran its item concurrently
+    with the chain the user started after the cancel, whose Phase 1
+    "unload all models" killed the active run (accuracy collapsed to 0.0%).
+    """
+
+    def setup_method(self):
+        self._reset_module_state()
+
+    def teardown_method(self):
+        # Leave no queue/gate state behind for other test files.
+        self._reset_module_state()
+
+    @staticmethod
+    def _reset_module_state():
+        accuracy_benchmark._queue.clear()
+        accuracy_benchmark._accuracy_runs.clear()
+        accuracy_benchmark._queue_running = False
+        accuracy_benchmark._current_run_id = None
+        accuracy_benchmark._current_model = None
+        reset_accumulated_results()
+
+    @staticmethod
+    def _request(model_id: str) -> AccuracyBenchmarkRequest:
+        return AccuracyBenchmarkRequest(model_id=model_id, benchmarks={"mmlu": 1})
+
+    @staticmethod
+    async def _wait_for(predicate, timeout=5.0):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not predicate():
+            assert loop.time() < deadline, "timed out waiting for condition"
+            await asyncio.sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_continue_queue_run_is_hard_cancellable(self):
+        """A queue-continued run records its chain task, so cancel_queue
+        cancels it immediately instead of leaving it to run until its next
+        on_progress checkpoint (up to a full generation batch away)."""
+        b_entered = asyncio.Event()
+        b_finished_normally = False
+
+        class StubEval:
+            async def load_dataset(self, sample_size=0):
+                return [{"id": "1"}]
+
+            async def run(self, engine, items, on_progress, batch_size=1,
+                          sampling_kwargs=None, enable_thinking=False):
+                nonlocal b_finished_normally
+                if engine.model_id == "model-b":
+                    b_entered.set()
+                    # Blocks until hard-cancelled; never returns on its own.
+                    await asyncio.Event().wait()
+                    b_finished_normally = True
+                return _StubResult()
+
+        pool = _StubEnginePool()
+        with patch.dict("omlx.eval.BENCHMARKS", {"mmlu": StubEval}, clear=True):
+            add_to_queue(self._request("model-a"))
+            add_to_queue(self._request("model-b"))
+            start_next_from_queue(pool)
+
+            # model-a completes instantly; model-b is started by
+            # _continue_queue, the path that used to leave task=None.
+            await asyncio.wait_for(b_entered.wait(), timeout=5)
+            run_b = get_run(get_queue_status()["current_bench_id"])
+            assert run_b.request.model_id == "model-b"
+            assert run_b.task is not None
+
+            await cancel_queue()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(run_b.task, timeout=5)
+
+        assert run_b.status == "cancelled"
+        assert not b_finished_normally
+        # The cancelled run still emits its terminal event so attached SSE
+        # streams close.
+        assert any(e["type"] == "error" for e in run_b.events)
+        assert run_b.terminal is True
+
+    @pytest.mark.asyncio
+    async def test_stale_chain_leaves_queue_and_gate_alone(self):
+        """_continue_queue holding a stale ownership token returns without
+        popping the queue or mutating the running gate."""
+        pool = _StubEnginePool()
+        add_to_queue(self._request("model-d"))
+        accuracy_benchmark._queue_running = True
+        accuracy_benchmark._current_run_id = "live-run"
+        accuracy_benchmark._current_model = "model-c"
+
+        await accuracy_benchmark._continue_queue(
+            pool, accuracy_benchmark._chain_id - 1
+        )
+
+        status = get_queue_status()
+        assert [q["model_id"] for q in status["queue"]] == ["model-d"]
+        assert status["running"] is True
+        assert accuracy_benchmark._current_run_id == "live-run"
+        assert accuracy_benchmark._current_model == "model-c"
+        assert pool.loaded == []  # stale chain never started a run
+
+    @pytest.mark.asyncio
+    async def test_cancel_then_requeue_does_not_corrupt_new_chain(self):
+        """The reported sequence: cancel during a queue-continued run, then
+        immediately queue new models. The orphaned chain must not pop the
+        new queue, flip the gate, or run anything concurrently with the
+        chain started after the cancel."""
+        b_entered = asyncio.Event()
+        b_release = asyncio.Event()
+        c_entered = asyncio.Event()
+        c_release = asyncio.Event()
+        # (event, model_id) log of evaluator.run entries/exits. The cancelled
+        # model-b run may legitimately overlap model-c while its last batch
+        # drains; the regression is model-d entering while model-c runs.
+        run_log: list[tuple[str, str]] = []
+
+        class StubEval:
+            async def load_dataset(self, sample_size=0):
+                return [{"id": "1"}]
+
+            async def run(self, engine, items, on_progress, batch_size=1,
+                          sampling_kwargs=None, enable_thinking=False):
+                run_log.append(("enter", engine.model_id))
+                try:
+                    if engine.model_id == "model-b":
+                        b_entered.set()
+                        # Simulate an in-flight generation batch: it keeps
+                        # running past the cancel and only notices it at the
+                        # next on_progress checkpoint.
+                        with contextlib.suppress(
+                            asyncio.TimeoutError, asyncio.CancelledError
+                        ):
+                            await asyncio.wait_for(asyncio.Event().wait(), 0.05)
+                        await b_release.wait()
+                        # Checkpoint: raises CancelledError, run is cancelled.
+                        await on_progress(1, 1)
+                    elif engine.model_id == "model-c":
+                        c_entered.set()
+                        await c_release.wait()
+                finally:
+                    run_log.append(("exit", engine.model_id))
+                return _StubResult()
+
+        pool = _StubEnginePool()
+        with patch.dict("omlx.eval.BENCHMARKS", {"mmlu": StubEval}, clear=True):
+            add_to_queue(self._request("model-a"))
+            add_to_queue(self._request("model-b"))
+            start_next_from_queue(pool)
+
+            await asyncio.wait_for(b_entered.wait(), timeout=5)
+            run_b = get_run(get_queue_status()["current_bench_id"])
+
+            # User cancels, then immediately queues two new models.
+            await cancel_queue()
+            add_to_queue(self._request("model-c"))
+            start_next_from_queue(pool)
+            add_to_queue(self._request("model-d"))
+            start_next_from_queue(pool)  # no-op: gate is held by model-c
+
+            await asyncio.wait_for(c_entered.wait(), timeout=5)
+            status = get_queue_status()
+            assert status["current_model"] == "model-c"
+            assert [q["model_id"] for q in status["queue"]] == ["model-d"]
+            c_bench_id = status["current_bench_id"]
+
+            # Let the soft-cancel window close: model-b's batch finishes and
+            # the orphaned chain reaches its trailing _continue_queue.
+            b_release.set()
+            await self._wait_for(lambda: run_b.terminal)
+            await asyncio.sleep(0.05)
+
+            # The stale chain must not have popped model-d, flipped the
+            # gate, or started anything next to the live chain.
+            status = get_queue_status()
+            assert [q["model_id"] for q in status["queue"]] == ["model-d"]
+            assert status["running"] is True
+            assert status["current_bench_id"] == c_bench_id
+            assert ("enter", "model-d") not in run_log
+
+            # The live chain finishes model-c, then runs model-d normally.
+            c_release.set()
+            await self._wait_for(
+                lambda: not get_queue_status()["running"]
+                and not get_queue_status()["queue"]
+            )
+
+        # model-d ran strictly after model-c finished — never concurrently.
+        assert run_log.index(("enter", "model-d")) > run_log.index(
+            ("exit", "model-c")
+        )
+        completed = [r["model_id"] for r in get_accumulated_results()]
+        assert completed == ["model-a", "model-c", "model-d"]

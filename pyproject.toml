@@ -68,7 +68,12 @@ dependencies = [
     # See pmarreck/omlx#1 for full repro and root cause.
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
+    # The admin downloader calls snapshot_download(dry_run=True) (1.0.0+)
+    # and cancels xet transfers via utils._xet.abort_xet_session, which was
+    # added in 1.19.0 together with the session-based xet download path
+    # (and drags in hf-xet>=1.5.1). Declare the floor directly instead of
+    # leaning on transformers' transitive hub requirement.
+    "huggingface-hub>=1.19.0",
     "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
@@ -185,6 +190,11 @@ dev = [
     # xgrammar / tvm-ffi version bumps. It skips when these aren't
     # importable, which silently hides regressions — install no-deps
     # in the dev environment so the test actually runs.
+    #
+    # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
+    # which conflicts with our transformers>=5.7.0 pin and makes
+    # pip/uv dev installs unresolvable (#2289). Bump again once
+    # upstream lifts the cap.
     "xgrammar==0.2.3",
     "apache-tvm-ffi==0.1.11",
 ]
@@ -243,6 +253,9 @@ target-version = ["py310", "py311", "py312", "py313"]
 line-length = 88
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
 ignore = ["E501", "B905"]
+# Vendored upstream files (mlx-vlm copies under patches) keep their
+# original formatting for pin-bump diffability.
+extend-exclude = ["omlx/patches/*/vendor"]
 
 [tool.mypy]
 python_version = "3.10"

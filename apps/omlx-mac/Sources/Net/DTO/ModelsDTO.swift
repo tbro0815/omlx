@@ -23,6 +23,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let isLoading: Bool
     let estimatedSize: Int64
     let estimatedSizeFormatted: String?
+    let actualSize: Int64?
+    let actualSizeFormatted: String?
     let pinned: Bool?
     let isDefault: Bool?
     let isFavorite: Bool?
@@ -47,7 +49,21 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
+    /// True for builtin virtual entries (e.g. the MarkItDown document
+    /// converter) that have no real load/unload lifecycle.
+    let virtual: Bool?
     let settings: ModelSettingsDTO?
+}
+
+extension ModelDTO {
+    /// Single size figure for compact UI: the observed footprint once the
+    /// model has settled, the estimate while loading or before one exists.
+    var sizeLabel: String {
+        if isLoading {
+            return estimatedSizeFormatted ?? ""
+        }
+        return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
+    }
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {

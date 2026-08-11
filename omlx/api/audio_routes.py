@@ -8,7 +8,9 @@ This module provides OpenAI-compatible audio endpoints:
 - POST /v1/audio/process         - Speech-to-Speech / audio processing
 """
 
+import asyncio
 import base64
+import io
 import json
 import logging
 import math
@@ -39,6 +41,18 @@ MAX_REF_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
 # improve TTFT while still letting the model process the full input at once.
 DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.2
 MIN_NATIVE_TTS_STREAMING_INTERVAL_SECONDS = 0.01
+
+# Non-streaming TTS output formats and their Content-Type. wav is the native
+# engine output; the others are transcoded in memory by soundfile's bundled
+# libsndfile (lame/opus/flac), which the audio extra already ships via
+# mlx-audio -> librosa. aac is not offered (libsndfile has no aac encoder).
+_SPEECH_RESPONSE_FORMATS = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/ogg",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+}
 
 # Video container extensions that should be routed through ffmpeg decoding.
 # mlx-audio only recognises audio-specific extensions (m4a, aac, ogg, opus),
@@ -611,6 +625,27 @@ async def list_model_voices(model: Optional[str] = None):
     return {"model": resolved, "voices": voices}
 
 
+def _transcode_speech_output(wav_bytes: bytes, response_format: str) -> bytes:
+    """Transcode the engine's native WAV output to response_format in memory."""
+    if response_format == "pcm":
+        return wav_bytes_to_pcm_frames(wav_bytes)[3]
+
+    # Lazy import like the other optional audio deps: soundfile ships with
+    # the audio extra (mlx-audio -> librosa -> soundfile), and this module
+    # must stay importable without it (see server.py route registration).
+    import soundfile as sf
+
+    data, sample_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    buf = io.BytesIO()
+    if response_format == "mp3":
+        sf.write(buf, data, sample_rate, format="MP3")
+    elif response_format == "opus":
+        sf.write(buf, data, sample_rate, format="OGG", subtype="OPUS")
+    else:
+        sf.write(buf, data, sample_rate, format="FLAC")
+    return buf.getvalue()
+
+
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
@@ -619,9 +654,18 @@ async def create_speech(request: AudioSpeechRequest):
 
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+    response_format = request.response_format or "wav"
+    if response_format not in _SPEECH_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format '{request.response_format}' is not supported; "
+                f"available formats: {', '.join(_SPEECH_RESPONSE_FORMATS)}"
+            ),
+        )
     streaming_interval = DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
     if request.stream:
-        if request.response_format not in (None, "wav"):
+        if response_format != "wav":
             raise HTTPException(
                 status_code=400,
                 detail="Streaming TTS currently only supports response_format='wav'",
@@ -699,7 +743,18 @@ async def create_speech(request: AudioSpeechRequest):
 
     _record_audio_request(resolved_model)
 
-    return Response(content=wav_bytes, media_type="audio/wav")
+    audio_out = wav_bytes
+    if response_format != "wav":
+        try:
+            audio_out = await asyncio.to_thread(
+                _transcode_speech_output, wav_bytes, response_format
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return Response(
+        content=audio_out, media_type=_SPEECH_RESPONSE_FORMATS[response_format]
+    )
 
 
 @router.post("/v1/audio/process")

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 
 from . import settings as _settings
+from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
 from .utils.proc_memory import get_phys_footprint
 
@@ -660,6 +661,51 @@ class ProcessMemoryEnforcer:
         """Public accessor used by engine_pool pre-load admission."""
         return self._get_hard_limit_bytes()
 
+    def get_admission_ceiling(self) -> int:
+        """Best-effort pre-load ceiling that survives disabling the guard.
+
+        ``get_final_ceiling()`` returns 0 when the prefill memory guard is
+        off, which used to disable engine-pool pre-load eviction entirely:
+        loading a second model would overcommit physical memory and thrash
+        the machine instead of evicting the LRU model (#2290). This
+        accessor keeps load-time eviction working independently of the
+        guard toggle by falling back to the static ceiling (total RAM
+        minus the tier reserve) when the guard is disabled.
+
+        The Metal cap and the dynamic (vm_stat) ceiling are deliberately
+        excluded from the fallback: with the guard off nothing is wired,
+        allocations beyond Apple's recommended working set stay pageable,
+        and workloads legitimately run above that cap. The engine pool
+        treats this fallback as best-effort — it evicts idle LRU models to
+        fit under it but never refuses a load, preserving the unguarded
+        "no hard limits" semantics.
+        """
+        if self._prefill_memory_guard:
+            return self._get_hard_limit_bytes()
+        return self._get_static_ceiling()
+
+    def get_admission_soft_target(self) -> int:
+        """Soft watermark that pre-load admission evicts down to (#2319).
+
+        The admission check used to evict idle models only when the
+        projected total exceeded the final ceiling, while every other
+        pressure mechanism (pressure levels, prefill-headroom eviction)
+        targets the soft watermark. A second model admitted into the
+        soft..ceiling band kept both models resident through the load,
+        pushing the process into hard-pressure swap until the first
+        request's prefill guard finally evicted the old one. Exposing the
+        soft watermark lets the engine pool evict idle LRU models down to
+        the same target *before* the new weights start allocating; load
+        refusal stays governed by the admission ceiling.
+
+        Returns 0 when no ceiling is available (callers fall back to
+        ceiling-only admission).
+        """
+        ceiling = self.get_admission_ceiling()
+        if ceiling <= 0:
+            return 0
+        return int(ceiling * self._soft_threshold)
+
     def _get_abort_limit_bytes(self) -> int:
         """Stable physical cap used to ABORT an in-flight prefill.
 
@@ -1009,11 +1055,24 @@ class ProcessMemoryEnforcer:
         hot_cache_reserved = (
             self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
         )
+        # Clamp to the reservation: the usage-side exclusion must never exceed
+        # what the ceiling actually gave up, or a transient hot-cache overshoot
+        # past max_bytes would net-weaken the guard exactly under pressure.
+        hot_cache_used = (
+            min(self._hot_cache_used_bytes(), hot_cache_reserved)
+            if hot_cache_reserved > 0
+            else 0
+        )
         scheduler_ceiling = self._scheduler_limit_bytes(
             ceiling, reserved=hot_cache_reserved
         )
         soft_limit = (
             int(scheduler_ceiling * self._soft_threshold)
+            if scheduler_ceiling > 0
+            else 0
+        )
+        hard_watermark = (
+            int(scheduler_ceiling * self._hard_threshold)
             if scheduler_ceiling > 0
             else 0
         )
@@ -1045,6 +1104,12 @@ class ProcessMemoryEnforcer:
                     continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue
+                if isinstance(engine, BaseNonStreamingEngine):
+                    # TTS/STT/STS/Embedding/Reranker engines run on the MLX
+                    # executor without a Scheduler, so an unresolvable
+                    # scheduler is their normal shape, not a wrapper break.
+                    # Warning here reads as a guard regression (#2312).
+                    continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
                 # ``_resolve_scheduler()`` return None on a loaded engine
@@ -1066,6 +1131,7 @@ class ProcessMemoryEnforcer:
                 continue
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = scheduler_ceiling
+            scheduler._memory_hard_watermark_bytes = hard_watermark
             scheduler._memory_abort_limit_bytes = scheduler_abort_limit
             scheduler._prefill_abort_margin = self._get_prefill_abort_margin()
             # Propagate the component ceilings too so the rejection
@@ -1077,6 +1143,12 @@ class ProcessMemoryEnforcer:
             scheduler._memory_dynamic_ceiling_bytes = breakdown["dynamic"]
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
+            # Usage-side counterpart of the reservation above: targets whose
+            # usage read is raw phys_footprint (the DFlash primary guard)
+            # subtract this so serialized hot-cache CPU bytes are not charged
+            # both here and in the reserved ceiling. The Scheduler reads its
+            # own live counter instead and ignores this attr.
+            scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs

@@ -56,8 +56,14 @@ def run_specprefill_target_prefill(
             _find_attention_layers,
             _get_attn_module,
             _OffsetAdjustedRoPE,
+            cleanup_rope,
             sparse_prefill,
         )
+
+        # A stale _OffsetAdjustedRoPE can survive if a prior specprefill
+        # request never reached its cleanup (#766). Restore the genuine rope
+        # before any prefill so system KV is written at true positions.
+        cleanup_rope(target_model)
 
         system_token_count = plan.system_token_count
         conversation_tokens = plan.conversation_tokens

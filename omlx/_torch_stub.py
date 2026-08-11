@@ -20,6 +20,7 @@ When a real torch is installed (pip / Homebrew flow) the stub is a no-op:
 from __future__ import annotations
 
 import importlib.machinery
+import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -363,11 +364,11 @@ def install() -> bool:
         _INSTALLED = True
         needs_version_check = True
 
-    # Fire the version-drift check OUTSIDE the install lock. xgrammar's
-    # C++ extension load can be slow on a cold disk; running it under
-    # the lock would block every concurrent install() caller behind one
-    # cold import. install() is idempotent at this point — _INSTALLED is
-    # set and any racing caller short-circuits at the top of the lock.
+    # Fire the version-drift check OUTSIDE the install lock — it reads
+    # distribution metadata from disk and there is no reason to hold up
+    # concurrent install() callers behind it. install() is idempotent at
+    # this point — _INSTALLED is set and any racing caller short-circuits
+    # at the top of the lock.
     if needs_version_check:
         try:
             warn_if_unexpected_versions()
@@ -377,16 +378,19 @@ def install() -> bool:
 
 
 def warn_if_unexpected_versions() -> None:
-    """Log a warning when bundled xgrammar / tvm-ffi versions drift past the
-    versions this stub was tested against. Best-effort: silent if the
-    imports themselves haven't happened yet, since the stub is installed
-    eagerly at startup.
+    """Log a warning when installed xgrammar / tvm-ffi versions drift past
+    the versions this stub was tested against.
+
+    Reads distribution metadata instead of module attributes: xgrammar
+    exposes no ``__version__`` (checked on 0.2.3 and 0.2.4), so the old
+    ``getattr(xgrammar, "__version__", None)`` probe never fired and the
+    drift warning was dead code. Metadata also avoids importing the heavy
+    C++ extension just to read a version string. Best-effort: silent when
+    a distribution is not installed.
     """
     try:
-        import xgrammar  # type: ignore[import-not-found]
-
-        v = getattr(xgrammar, "__version__", None)
-        if v and v not in _TARGET_XGRAMMAR_VERSIONS:
+        v = importlib.metadata.version("xgrammar")
+        if v not in _TARGET_XGRAMMAR_VERSIONS:
             logger.warning(
                 "xgrammar %s is not in the torch-stub target set %s; "
                 "structured output may fail at runtime. Update the stub "
@@ -397,10 +401,8 @@ def warn_if_unexpected_versions() -> None:
     except Exception:
         pass
     try:
-        import tvm_ffi  # type: ignore[import-not-found]
-
-        v = getattr(tvm_ffi, "__version__", None)
-        if v and v not in _TARGET_TVM_FFI_VERSIONS:
+        v = importlib.metadata.version("apache-tvm-ffi")
+        if v not in _TARGET_TVM_FFI_VERSIONS:
             logger.warning(
                 "apache-tvm-ffi %s is not in the torch-stub target set %s; "
                 "structured output may fail at runtime.",

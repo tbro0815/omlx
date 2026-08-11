@@ -46,6 +46,7 @@ from omlx.oq import (
     _is_moe_router,
     _is_vision_tensor,
     _LazyTensorIndex,
+    _load_builtin_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
@@ -764,6 +765,35 @@ class TestValidateQuantizable:
             validate_quantizable({"quantization_config": {"quant_method": "fp8"}})
             is True
         )
+
+    def test_compressed_tensors_float_quantized_is_quantizable(self):
+        # Laguna-style FP8: fp8 weights + block scales the lazy index dequants
+        assert (
+            validate_quantizable(
+                {
+                    "quantization_config": {
+                        "quant_method": "compressed-tensors",
+                        "format": "float-quantized",
+                    }
+                }
+            )
+            is True
+        )
+
+    def test_compressed_tensors_packed_not_quantizable(self):
+        # pack-quantized / nvfp4-pack-quantized carry true low-bit weights
+        for fmt in ("pack-quantized", "nvfp4-pack-quantized"):
+            assert (
+                validate_quantizable(
+                    {
+                        "quantization_config": {
+                            "quant_method": "compressed-tensors",
+                            "format": fmt,
+                        }
+                    }
+                )
+                is False
+            )
 
     def test_non_fp8_quantization_config(self):
         # Other quant methods (gptq, awq) are already quantized
@@ -1827,6 +1857,28 @@ class TestOQECalibrationData:
         assert multilingual_share >= 0.25
         assert shares["tool_calling"] <= 0.18
         assert max(shares.values()) <= 0.18
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestCalibrationSampleDeterminism:
+    """Calibration subsampling must not depend on the global RNG (#2293)."""
+
+    class _ByteTokenizer:
+        def encode(self, text):
+            return list(text.encode("utf-8")[:64])
+
+    def test_builtin_calibration_subset_is_deterministic(self):
+        tokenizer = self._ByteTokenizer()
+        mx.random.seed(111)
+        first = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        mx.random.seed(222)
+        second = _load_builtin_calibration(
+            tokenizer, "code_multilingual", num_samples=4, seq_length=64
+        )
+        assert first.shape == (4, 64)
+        assert mx.array_equal(first, second).item()
 
 
 # =============================================================================
@@ -3954,6 +4006,29 @@ class TestMeasureSensitivityVlmMtp:
         )
 
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
+
+
+class TestCollectImatrixTextLoad:
+    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
+        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+        from omlx import oq as oq_mod
+        import omlx.utils.model_loading as real_ml
+
+        mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
+        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
+        monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
+        monkeypatch.setattr(
+            real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
+        )
+        monkeypatch.setattr(real_ml, "maybe_apply_pre_load_patches", MagicMock())
+        monkeypatch.setattr(
+            oq_mod, "_collect_imatrix_from_model", MagicMock(return_value=({}, {}))
+        )
+
+        oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
+
+        assert "trust_remote_code" not in mock_load.call_args.kwargs
 
 
 class TestMeasureSensitivityQuantizedVlm:

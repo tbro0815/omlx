@@ -9,12 +9,13 @@ tokens because providers batch multiple tokens per chunk.
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,27 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=3600.0, write=120.0, pool=30.
 
 _ERROR_DETAIL_MAX_CHARS = 300
 
+_REASONING_FIELD_NAMES = ("reasoning_content", "reasoning", "analysis")
+
+# Thinking models spend reasoning tokens before message.content, and those
+# tokens count toward max_tokens on OpenAI-compatible APIs, so a small cap
+# truncates them before they can answer (#2309). max_tokens only bounds
+# runaway generation; non-thinking endpoints still stop after a few tokens.
+_PREFLIGHT_MAX_TOKENS = 4096
+
+# Provider-specific request JSON must not override fields owned by the
+# benchmark or authentication layer.
+PROTECTED_EXTRA_BODY_FIELDS = frozenset({
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "temperature",
+    "api_key",
+    "authorization",
+})
+
 
 class ExternalEndpointConfig(BaseModel):
     """Connection settings for an external OpenAI-compatible endpoint.
@@ -37,6 +59,7 @@ class ExternalEndpointConfig(BaseModel):
     base_url: str
     api_key: SecretStr = SecretStr("")
     model: str
+    extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("base_url")
     @classmethod
@@ -54,9 +77,32 @@ class ExternalEndpointConfig(BaseModel):
             raise ValueError("model must not be empty")
         return v
 
+    @field_validator("extra_body", mode="before")
+    @classmethod
+    def validate_extra_body(cls, v: Any) -> dict[str, Any]:
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("extra_body must be a JSON object")
+        blocked = sorted(
+            str(key)
+            for key in v
+            if str(key).lower() in PROTECTED_EXTRA_BODY_FIELDS
+        )
+        if blocked:
+            raise ValueError(
+                "extra_body cannot override protected field(s): "
+                + ", ".join(blocked)
+            )
+        return dict(v)
+
 
 class ExternalEndpointError(Exception):
     """User-presentable failure talking to an external endpoint."""
+
+    def __init__(self, message: str, status: str = "invalid_response"):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -80,6 +126,10 @@ class ChatResult:
     text: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    finish_reason: Optional[str] = None
+    status: str = "ok"
+    reasoning_fields_present: tuple[str, ...] = ()
+    reasoning_fields_nonempty: tuple[str, ...] = ()
 
 
 def _extract_error_detail(body: str) -> str:
@@ -104,9 +154,9 @@ def _extract_error_detail(body: str) -> str:
 class ExternalAPIClient:
     """Async client for an external OpenAI-compatible /chat/completions API.
 
-    Only a whitelist of request fields is ever sent (model, messages,
-    max_tokens, stream, stream_options, temperature) because providers
-    commonly reject unknown parameters with HTTP 400.
+    Provider-specific fields may be supplied through config.extra_body. The
+    config validator prevents them from overriding benchmark-owned or
+    authentication-related fields.
     """
 
     def __init__(
@@ -149,35 +199,79 @@ class ExternalAPIClient:
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
+        body.update(self._config.extra_body)
         return body
+
+    def _redact_secret(self, text: str) -> str:
+        """Defensively remove the configured key from provider errors."""
+        key = self._config.api_key.get_secret_value()
+        if key:
+            return text.replace(key, "[REDACTED]")
+        return text
 
     def _map_transport_error(self, exc: httpx.HTTPError) -> ExternalEndpointError:
         base_url = self._config.base_url
-        if isinstance(exc, httpx.ConnectTimeout):
+        if isinstance(exc, httpx.TimeoutException):
+            if isinstance(exc, httpx.ConnectTimeout):
+                return ExternalEndpointError(
+                    f"Timed out connecting to external endpoint {base_url}",
+                    status="timeout",
+                )
             return ExternalEndpointError(
-                f"Timed out connecting to external endpoint {base_url}"
+                "External endpoint timed out while waiting for a response",
+                status="timeout",
             )
         if isinstance(exc, httpx.ConnectError):
             return ExternalEndpointError(
-                f"Cannot connect to external endpoint {base_url}: {exc}"
-            )
-        if isinstance(exc, httpx.ReadTimeout):
-            return ExternalEndpointError(
-                "External endpoint timed out while waiting for a response"
+                self._redact_secret(
+                    f"Cannot connect to external endpoint {base_url}: {exc}"
+                ),
+                status="connection_error",
             )
         return ExternalEndpointError(
-            f"External endpoint request failed: {type(exc).__name__}: {exc}"
+            self._redact_secret(
+                f"External endpoint request failed: {type(exc).__name__}: {exc}"
+            ),
+            status="connection_error",
         )
 
     def _status_error(self, status: int, body_text: str) -> ExternalEndpointError:
         if status in (401, 403):
             return ExternalEndpointError(
-                f"External endpoint rejected the API key (HTTP {status})"
+                f"External endpoint rejected the API key (HTTP {status})",
+                status="http_error",
             )
-        detail = _extract_error_detail(body_text)
+        detail = self._redact_secret(_extract_error_detail(body_text))
         return ExternalEndpointError(
-            f"External endpoint returned HTTP {status}: {detail}"
+            f"External endpoint returned HTTP {status}: {detail}",
+            status="http_error",
         )
+
+    @staticmethod
+    def _reasoning_diagnostics(
+        message: dict[str, Any],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        present: list[str] = []
+        nonempty: list[str] = []
+        for name in _REASONING_FIELD_NAMES:
+            if name not in message:
+                continue
+            present.append(name)
+            value = message.get(name)
+            if isinstance(value, str):
+                has_value = bool(value.strip())
+            else:
+                has_value = value is not None and bool(value)
+            if has_value:
+                nonempty.append(name)
+        return tuple(present), tuple(nonempty)
+
+    @staticmethod
+    def _usage_int(usage: dict[str, Any], name: str) -> int:
+        try:
+            return int(usage.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     async def chat_completion(
         self,
@@ -195,17 +289,64 @@ class ExternalAPIClient:
             raise self._status_error(response.status_code, response.text)
         try:
             data = response.json()
-            choice = data["choices"][0]
-        except (KeyError, IndexError, TypeError, ValueError) as e:
+        except ValueError as e:
             raise ExternalEndpointError(
-                f"External endpoint returned an unexpected response shape: {e}"
+                "External endpoint returned a non-JSON response",
+                status="invalid_response",
             ) from e
-        text = (choice.get("message") or {}).get("content") or ""
+
+        try:
+            if not isinstance(data, dict):
+                raise TypeError("top-level response is not an object")
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise KeyError("choices[0]")
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise TypeError("choices[0] is not an object")
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise KeyError("choices[0].message")
+        except (KeyError, TypeError) as e:
+            raise ExternalEndpointError(
+                f"External endpoint returned an unexpected response shape: {e}",
+                status="invalid_response",
+            ) from e
+
+        content = message.get("content")
+        if content is None:
+            text = ""
+        elif isinstance(content, str):
+            text = content
+        else:
+            raise ExternalEndpointError(
+                "External endpoint returned non-text message.content",
+                status="invalid_response",
+            )
+
+        finish_reason_value = choice.get("finish_reason")
+        finish_reason = (
+            str(finish_reason_value) if finish_reason_value is not None else None
+        )
+        reasoning_present, reasoning_nonempty = self._reasoning_diagnostics(message)
+        if finish_reason == "length":
+            status = "truncated"
+        elif not text.strip():
+            status = "empty_content"
+        else:
+            status = "ok"
+
         usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         return ChatResult(
             text=text,
-            prompt_tokens=int(usage.get("prompt_tokens") or 0),
-            completion_tokens=int(usage.get("completion_tokens") or 0),
+            prompt_tokens=self._usage_int(usage, "prompt_tokens"),
+            completion_tokens=self._usage_int(usage, "completion_tokens"),
+            finish_reason=finish_reason,
+            status=status,
+            reasoning_fields_present=reasoning_present,
+            reasoning_fields_nonempty=reasoning_nonempty,
         )
 
     async def stream_chat_completion(
@@ -300,6 +441,11 @@ class _AdapterOutput:
     text: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    external_status: str = "ok"
+    finish_reason: Optional[str] = None
+    reasoning_fields_present: tuple[str, ...] = ()
+    reasoning_fields_nonempty: tuple[str, ...] = ()
+    error_message: str = ""
 
 
 class ExternalChatAdapter:
@@ -315,18 +461,57 @@ class ExternalChatAdapter:
     """
 
     model_type = None
+    is_external_api = True
 
     def __init__(self, client: ExternalAPIClient, sampling_profile: str):
         self._client = client
         self._sampling_profile = sampling_profile
 
     async def preflight(self) -> None:
-        """Fail fast on auth/URL/model errors before a long evaluation."""
-        await self._client.chat_completion(
-            messages=[{"role": "user", "content": "Say OK"}],
-            max_tokens=4,
+        """Validate final-answer compatibility before a paid evaluation."""
+        result = await self._client.chat_completion(
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            max_tokens=_PREFLIGHT_MAX_TOKENS,
             temperature=None,
         )
+        logger.info(
+            "External accuracy preflight: finish_reason=%r "
+            "reasoning_fields_present=%s reasoning_fields_nonempty=%s",
+            result.finish_reason,
+            list(result.reasoning_fields_present),
+            list(result.reasoning_fields_nonempty),
+        )
+        if result.status == "truncated":
+            raise ExternalEndpointError(
+                "External API preflight was truncated (finish_reason=length)",
+                status="truncated",
+            )
+        if result.status == "empty_content":
+            if result.reasoning_fields_nonempty:
+                raise ExternalEndpointError(
+                    "External API connected, but message.content is empty. "
+                    "The model may still be in reasoning mode, or the endpoint "
+                    "response format may be incompatible with oMLX.",
+                    status="empty_content",
+                )
+            raise ExternalEndpointError(
+                "External API connected, but preflight message.content is empty",
+                status="empty_content",
+            )
+        # Some endpoints inline reasoning into message.content as <think>
+        # blocks; drop them before checking, the same way eval scoring does.
+        answer = re.sub(
+            r"<think>.*?</think>", "", result.text, flags=re.DOTALL
+        ).strip()
+        # Accept a leading OK with trailing punctuation or extra words
+        # (OK. / Okay / OK!) so a compliant endpoint is not rejected over
+        # formatting. A genuinely wrong or negated reply (NOT OK) still fails.
+        if not answer.upper().startswith("OK"):
+            raise ExternalEndpointError(
+                "External API preflight response did not start with OK in "
+                "message.content",
+                status="parse_error",
+            )
 
     async def chat(
         self,
@@ -335,13 +520,24 @@ class ExternalChatAdapter:
         **kwargs: Any,
     ) -> _AdapterOutput:
         temperature = 0.0 if self._sampling_profile == "deterministic" else None
-        result = await self._client.chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        try:
+            result = await self._client.chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except ExternalEndpointError as exc:
+            return _AdapterOutput(
+                text="",
+                external_status=exc.status,
+                error_message=str(exc),
+            )
         return _AdapterOutput(
             text=result.text,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            external_status=result.status,
+            finish_reason=result.finish_reason,
+            reasoning_fields_present=result.reasoning_fields_present,
+            reasoning_fields_nonempty=result.reasoning_fields_nonempty,
         )

@@ -39,13 +39,16 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from ..scheduler import _sync_and_clear_cache
+
 logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
 
-# Loaded model classes whose module path marks the Qwen3.5/3.6 family
-# (mlx_lm qwen3_5 / qwen3_5_moe and the omlx single-checkpoint MTP wrapper).
-_FAMILY_TOKENS = ("qwen3_5", "qwen3_6", "qwen35")
+# Loaded model classes whose module path marks a supported SwitchGLU family
+# (mlx_lm qwen3_5 / qwen3_5_moe, the omlx single-checkpoint MTP wrapper, and
+# the vendored laguna module).
+_FAMILY_TOKENS = ("qwen3_5", "qwen3_6", "qwen35", "laguna")
 
 
 def _is_supported_family(model: Any) -> bool:
@@ -204,6 +207,12 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     _ensure_vlm_verify_patch()
     for switch_mlp in targets:
         _fuse_one(switch_mlp)
+        # The freed gate/up buffers land in the MLX buffer pool, which the
+        # server pins to total RAM (#300), so nothing releases them during
+        # load and the transient grows by the whole routed gate/up set,
+        # ~2/3 of the expert bytes (#2304). Drain per fused layer to bound
+        # the transient to a single layer's worth.
+        _sync_and_clear_cache()
     logger.info("Qwen MoE gate+up fusion applied: %d layers", len(targets))
     return len(targets)
 

@@ -317,6 +317,7 @@
             hfModelsLoaded: false,
             hfError: '',
             hfSuccess: '',
+            hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
 
@@ -552,6 +553,8 @@
             accSamplingProfile: 'deterministic',
             accAdvancedOptionsOpen: false,
             accExternalEnabled: false,
+            // Provider-specific JSON is intentionally session-only.
+            accExternalExtraBody: '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -1135,7 +1138,13 @@
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
                     if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
+                        continue;
+                    }
+                    if (k === 'thinking_budget_tokens') {
+                        if (ms.enableThinkingBudget && ms.thinking_budget_tokens) {
+                            out.thinking_budget_tokens = Number(ms.thinking_budget_tokens);
+                        }
                         continue;
                     }
                     if (k === 'index_cache_freq') {
@@ -1143,7 +1152,9 @@
                         continue;
                     }
                     if (k === 'max_tool_result_tokens') {
-                        if (ms.enableToolResultLimit) out.max_tool_result_tokens = ms.max_tool_result_tokens || null;
+                        if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
+                            out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+                        }
                         continue;
                     }
                     if (k === 'guided_grammar_enabled') {
@@ -1151,14 +1162,16 @@
                         continue;
                     }
                     if (k === 'guided_grammar') {
-                        out.guided_grammar = ms.guided_grammar_enabled
-                            ? ((ms.guided_grammar || '').trim() || null)
-                            : null;
+                        const g = ms.guided_grammar_enabled ? (ms.guided_grammar || '').trim() : '';
+                        if (g) out.guided_grammar = g;
                         continue;
                     }
-                    // Standard field: apply nullish coalescing; coerce string numerics
-                    let v = ms[k] ?? null;
-                    if (typeof v === 'string' && v !== '' && !isNaN(Number(v))) v = Number(v);
+                    // Standard field: omit unset values entirely — the server
+                    // treats absent universal keys as "reset to default" when
+                    // the profile is applied (snapshot semantics).
+                    let v = ms[k];
+                    if (v === undefined || v === null || v === '') continue;
+                    if (typeof v === 'string' && !isNaN(Number(v))) v = Number(v);
                     out[k] = v;
                 }
 
@@ -2843,6 +2856,43 @@
                 };
             },
 
+            parseAccuracyExtraBody() {
+                const raw = this.accExternalExtraBody.trim();
+                if (!raw) return {};
+
+                let value;
+                try {
+                    value = JSON.parse(raw);
+                } catch (_) {
+                    throw new Error(window.t('js.error.external_extra_body_invalid_json'));
+                }
+                if (value === null || Array.isArray(value) || typeof value !== 'object') {
+                    throw new Error(window.t('js.error.external_extra_body_object_required'));
+                }
+
+                const protectedFields = new Set([
+                    'model', 'messages', 'stream', 'stream_options',
+                    'max_tokens', 'temperature', 'api_key', 'authorization',
+                ]);
+                const blocked = Object.keys(value).filter(
+                    key => protectedFields.has(key.toLowerCase())
+                );
+                if (blocked.length > 0) {
+                    throw new Error(
+                        window.t('js.error.external_extra_body_protected')
+                            .replace('{fields}', blocked.sort().join(', '))
+                    );
+                }
+                return value;
+            },
+
+            accuracyExternalRequestBody() {
+                const body = this.externalRequestBody();
+                const extraBody = this.parseAccuracyExtraBody();
+                if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                return body;
+            },
+
             // Benchmark functions
             async startBenchmark() {
                 if (this.benchExternalEnabled) {
@@ -3321,9 +3371,16 @@
             },
 
             async addToAccQueue() {
+                let externalRequest = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
+                        return;
+                    }
+                    try {
+                        externalRequest = this.accuracyExternalRequestBody();
+                    } catch (err) {
+                        this.accError = err.message;
                         return;
                     }
                 } else if (!this.accModelId) {
@@ -3348,7 +3405,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
-                            external: this.accExternalEnabled ? this.externalRequestBody() : null,
+                            external: externalRequest,
                         }),
                     });
                     if (!resp.ok) {
@@ -3582,6 +3639,20 @@
                             pad(r.time_s, 10) +
                             pad(r.thinking_used ? 'Yes' : 'No', 8)
                         );
+                        if (r.external) {
+                            lines.push(
+                                `  Valid responses: ${r.valid_response_count}/${r.total}` +
+                                ` (${(r.valid_response_rate * 100).toFixed(1)}%)` +
+                                ` · Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%` +
+                                ` · Empty: ${r.empty_content_count}` +
+                                ` · Truncated: ${r.truncated_count}` +
+                                ` · Timeout: ${r.timeout_count}` +
+                                ` · HTTP: ${r.http_error_count}` +
+                                ` · Connection: ${r.connection_error_count}` +
+                                ` · Invalid: ${r.invalid_response_count}` +
+                                ` · Parse: ${r.parse_error_count}`
+                            );
+                        }
                     }
                 }
 
@@ -3611,7 +3682,7 @@
                 const qr = r.question_results || [];
 
                 if (format === 'json') {
-                    content = JSON.stringify({
+                    const exportData = {
                         model_id: r.model_id,
                         benchmark: r.benchmark,
                         accuracy: r.accuracy,
@@ -3621,13 +3692,43 @@
                         thinking_used: r.thinking_used || false,
                         category_scores: r.category_scores || null,
                         questions: qr,
-                    }, null, 2);
+                    };
+                    if (r.external) {
+                        Object.assign(exportData, {
+                            valid_response_count: r.valid_response_count,
+                            empty_content_count: r.empty_content_count,
+                            truncated_count: r.truncated_count,
+                            timeout_count: r.timeout_count,
+                            http_error_count: r.http_error_count,
+                            connection_error_count: r.connection_error_count,
+                            invalid_response_count: r.invalid_response_count,
+                            parse_error_count: r.parse_error_count,
+                            wrong_count: r.wrong_count,
+                            valid_response_rate: r.valid_response_rate,
+                            valid_answer_accuracy: r.valid_answer_accuracy,
+                            reliability_warning: r.reliability_warning,
+                        });
+                    }
+                    content = JSON.stringify(exportData, null, 2);
                     mime = 'application/json';
                 } else if (format === 'csv') {
                     const esc = s => '"' + (s || '').replace(/"/g, '""') + '"';
-                    const lines = ['id,category,correct,expected,predicted,question,raw_response,time_s'];
+                    const lines = [r.external
+                        ? 'id,category,status,correct,expected,predicted,finish_reason,reasoning_fields,prompt_tokens,completion_tokens,error_message,question,raw_response,time_s'
+                        : 'id,category,correct,expected,predicted,question,raw_response,time_s'];
                     for (const q of qr) {
-                        lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        if (r.external) {
+                            lines.push([
+                                q.id, esc(q.category || ''), esc(q.status || ''), q.correct,
+                                esc(q.expected), esc(q.predicted), esc(q.finish_reason || ''),
+                                esc((q.reasoning_fields_nonempty || []).join('|')),
+                                q.prompt_tokens || 0, q.completion_tokens || 0,
+                                esc(q.error_message || ''), esc(q.question),
+                                esc(q.raw_response), q.time_s,
+                            ].join(','));
+                        } else {
+                            lines.push([q.id, esc(q.category || ''), q.correct, esc(q.expected), esc(q.predicted), esc(q.question), esc(q.raw_response), q.time_s].join(','));
+                        }
                     }
                     content = lines.join('\n');
                     mime = 'text/csv';
@@ -3639,9 +3740,20 @@
                         `Time: ${r.time_s}s`,
                         '',
                     ];
+                    if (r.external) {
+                        lines.splice(4, 0,
+                            `Valid responses: ${r.valid_response_count}/${r.total} (${(r.valid_response_rate * 100).toFixed(1)}%)`,
+                            `Valid-answer accuracy: ${(r.valid_answer_accuracy * 100).toFixed(1)}%`,
+                            `Empty: ${r.empty_content_count}; Truncated: ${r.truncated_count}; Timeout: ${r.timeout_count}; HTTP errors: ${r.http_error_count}; Connection errors: ${r.connection_error_count}; Invalid responses: ${r.invalid_response_count}; Parse errors: ${r.parse_error_count}`
+                        );
+                    }
                     for (const q of qr) {
-                        lines.push(`--- Q${q.id} [${q.correct ? 'CORRECT' : 'WRONG'}] ---`);
+                        const label = r.external ? (q.status || 'invalid_response').toUpperCase() : (q.correct ? 'CORRECT' : 'WRONG');
+                        lines.push(`--- Q${q.id} [${label}] ---`);
                         if (q.category) lines.push(`Category: ${q.category}`);
+                        if (r.external && q.finish_reason) lines.push(`Finish reason: ${q.finish_reason}`);
+                        if (r.external && (q.reasoning_fields_nonempty || []).length) lines.push(`Reasoning fields: ${q.reasoning_fields_nonempty.join(', ')}`);
+                        if (r.external && q.error_message) lines.push(`Error: ${q.error_message}`);
                         lines.push(`Question: ${q.question || ''}`);
                         lines.push(`Expected: ${q.expected}`);
                         lines.push(`Predicted: ${q.predicted}`);
@@ -3680,9 +3792,11 @@
                 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
                 const idx = LEVELS.indexOf(lvl);
                 const minIdx = LEVELS.indexOf(this.logMinLevel);
+                // Levels at or above the minimum are all shown dark so the
+                // included range is obvious; the selected minimum keeps the ring.
                 if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
                 if (idx === minIdx) return 'bg-neutral-900 text-white';
-                return 'bg-neutral-200 text-neutral-700';
+                return 'bg-neutral-700 text-white';
             },
 
             async loadLogs() {
@@ -4974,6 +5088,7 @@
                     const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         // Attach original rank so the # column survives column-header re-sorts
                         this.hfRecommended = {
                             trending: (data.trending || []).map((m, i) => ({ ...m, rank: i + 1 })),
@@ -5140,6 +5255,7 @@
                     const response = await fetch(`/admin/api/hf/search?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
+                        this.hfTokenInvalid = !!data.hf_token_invalid;
                         this.hfSearchResults = data.models || [];
                         this.hfSearchLoaded = true;
                         // Save to search history

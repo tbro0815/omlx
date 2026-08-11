@@ -46,6 +46,7 @@ from ..api.utils import (
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..models.vlm import VLMModelAdapter
+from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -61,7 +62,16 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 # OCR model types that require special handling.
-OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
+# unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
+# unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to
+# match VLMBatchedEngine.model_type (== vlm_model.config.model_type).
+OCR_MODEL_TYPES = {
+    "deepseekocr",
+    "deepseekocr_2",
+    "unlimited-ocr",
+    "dots_ocr",
+    "glm_ocr",
+}
 
 # OCR model types and their default markdown conversion prompts.
 # When an OCR model receives a generic user prompt with an image,
@@ -69,6 +79,9 @@ OCR_MODEL_TYPES = {"deepseekocr", "deepseekocr_2", "dots_ocr", "glm_ocr"}
 OCR_MODEL_PROMPTS: Dict[str, str] = {
     "deepseekocr": "Convert the document to markdown.",
     "deepseekocr_2": "Convert the document to markdown.",
+    # baidu/Unlimited-OCR upstream-documented single-page baseline. Multi-page
+    # / PDF workflows use "Multi page parsing." (pass it explicitly).
+    "unlimited-ocr": "document parsing.",
     "dots_ocr": "Convert this page to clean Markdown while preserving reading order.",
     "glm_ocr": "Text Recognition:",
 }
@@ -105,6 +118,10 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 8192,
     },
     "deepseekocr_2": {
+        "temperature": 0.0,
+        "max_tokens": 8192,
+    },
+    "unlimited-ocr": {
         "temperature": 0.0,
         "max_tokens": 8192,
     },
@@ -762,11 +779,47 @@ _AUDIO_CONFIG_KEYS = (
 )
 
 
+def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
+    """Resolve the OptiQ multimodal sidecar declared by ``config.json``."""
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return None
+
+    optiq_vision = config.get("optiq_vision")
+    if not isinstance(optiq_vision, dict):
+        return None
+    relative_path = optiq_vision.get("sidecar")
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+
+    model_root = model_dir.resolve()
+    sidecar = (model_root / relative_path).resolve()
+    try:
+        sidecar.relative_to(model_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"OptiQ vision sidecar must stay inside the model directory: "
+            f"{relative_path}"
+        ) from exc
+    if sidecar.suffix != ".safetensors":
+        raise ValueError(f"OptiQ vision sidecar must be a safetensors file: {sidecar}")
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"OptiQ vision sidecar not found: {sidecar}")
+    return sidecar
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff any safetensors shard contains audio_tower / embed_audio keys."""
     import safetensors
 
-    for sf in model_dir.glob("*.safetensors"):
+    weight_files = list(model_dir.glob("*.safetensors"))
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is not None and all(sf.resolve() != sidecar for sf in weight_files):
+        weight_files.append(sidecar)
+
+    for sf in weight_files:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 for k in f.keys():
@@ -838,6 +891,70 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         yield
     finally:
         _vu.load_config = original
+
+
+@contextlib.contextmanager
+def _load_optiq_vision_sidecar_on_load(model_dir: Path):
+    """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
+
+    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
+    current OptiQ VLM checkpoints keep their unquantized multimodal weights
+    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
+    native glob already loads them.
+    """
+    sidecar = _resolve_optiq_vision_sidecar(model_dir)
+    if sidecar is None or sidecar.parent == model_dir.resolve():
+        yield
+        return
+
+    sidecar_weights = mx.load(str(sidecar))
+    if not isinstance(sidecar_weights, dict):
+        raise ValueError(f"OptiQ vision sidecar must contain named tensors: {sidecar}")
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    injected = False
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal injected
+        if injected or isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        model_weights = list(weights_items)
+        model_keys = {
+            item[0]
+            for item in model_weights
+            if isinstance(item, (tuple, list))
+            and len(item) >= 2
+            and isinstance(item[0], str)
+        }
+        duplicates = model_keys.intersection(sidecar_weights)
+        if duplicates:
+            sample = ", ".join(sorted(duplicates)[:3])
+            raise ValueError(
+                f"OptiQ vision sidecar duplicates model weights: {sample}"
+            )
+
+        injected = True
+        result = original_load_weights(
+            self,
+            [*model_weights, *sidecar_weights.items()],
+            *args,
+            **kwargs,
+        )
+        logger.info(
+            "Loaded %d OptiQ multimodal sidecar weights from %s",
+            len(sidecar_weights),
+            sidecar,
+        )
+        return result
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
 
 
 def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
@@ -1630,7 +1747,11 @@ class VLMBatchedEngine(BaseEngine):
         def _load_vlm_sync():
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
+            # omni: generic torch-free AutoProcessor fallback (fork-only).
+            # upstream 0.5.3: dedicated Pixtral/Mistral3 torch-free path (#2263).
+            # Both are idempotent and compose regardless of ordering — keep both.
             _patch_torch_free_auto_processor()
+            apply_pixtral_torch_free_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
@@ -1651,9 +1772,13 @@ class VLMBatchedEngine(BaseEngine):
                         trust_remote_code=self._trust_remote_code,
                     )
 
-                return vlm_load(
-                    self._model_name, trust_remote_code=self._trust_remote_code
-                )
+                with _load_optiq_vision_sidecar_on_load(
+                    Path(self._model_name)
+                ):
+                    return vlm_load(
+                        self._model_name,
+                        trust_remote_code=self._trust_remote_code,
+                    )
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
@@ -1667,6 +1792,22 @@ class VLMBatchedEngine(BaseEngine):
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
+
+        # t5 ternary: free unused bias tensors to recover ~420 MB RAM.
+        # The repacked safetensors carries 2-bit biases for format compat;
+        # the t5 symmetric kernel (scale*(q-1)) never reads them.
+        try:
+            from ..patches.bonsai_t5_load import free_t5_biases
+
+            freed = await loop.run_in_executor(
+                get_mlx_executor(), free_t5_biases, self._vlm_model
+            )
+            if freed > 0:
+                logger.info(
+                    "t5 bias tensors freed: %.0f MB recovered", freed / 1e6
+                )
+        except Exception:
+            logger.debug("t5 bias free skipped", exc_info=True)
 
         # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
@@ -2574,7 +2715,7 @@ class VLMBatchedEngine(BaseEngine):
             - image_cache_key_ranges: Per-image-turn cache key boundaries with
               cumulative image hashes
         """
-        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
 
@@ -2676,25 +2817,21 @@ class VLMBatchedEngine(BaseEngine):
                 formatted_messages, **template_kwargs
             )
         except ValueError:
-            # Processor has apply_chat_template but no chat_template set
-            # (e.g. mlx-vlm custom processor without processor_config.json).
-            # Fall back to processor.tokenizer which holds the actual template.
-            fallback = getattr(self._processor, "tokenizer", None)
-            if fallback is not None and fallback is not template_target:
-                try:
-                    prompt = fallback.apply_chat_template(
-                        formatted_messages, **template_kwargs
-                    )
-                except TypeError:
-                    if chat_template_kwargs:
-                        for key in chat_template_kwargs:
-                            template_kwargs.pop(key, None)
-                    template_kwargs.pop("enable_thinking", None)
-                    prompt = fallback.apply_chat_template(
-                        formatted_messages, **template_kwargs
-                    )
-            else:
-                raise
+            # Processor/tokenizer has apply_chat_template but no chat_template
+            # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
+            # chat template at all. mlx-vlm's get_chat_template handles this by
+            # rendering the messages into a plain prompt (the <image> tokens are
+            # already in the message content from get_message_json), preferring
+            # processor.chat_template -> processor.tokenizer.chat_template ->
+            # plain rendering, so it subsumes the tokenizer fallback too.
+            template_kwargs.pop("tokenize", None)
+            template_kwargs.pop("add_generation_prompt", None)
+            prompt = get_chat_template(
+                self._processor,
+                formatted_messages,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
 
         # Tokenize text and preprocess images and audio
         inputs = prepare_inputs(
@@ -2991,6 +3128,17 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs.pop("tools", None)
                 template_kwargs.pop("enable_thinking", None)
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
+            except ValueError:
+                # Tokenizer exposes apply_chat_template but has no chat_template
+                # set (e.g. raw baidu/Unlimited-OCR ships none). Fall back to
+                # mlx-vlm's plain-message rendering, matching the vision path.
+                from mlx_vlm.prompt_utils import get_chat_template
+
+                return get_chat_template(
+                    self._processor,
+                    messages,
+                    add_generation_prompt=True,
+                )
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
@@ -3090,6 +3238,7 @@ class VLMBatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
+            first_token_at=output.first_token_at,
         )
 
     async def stream_generate(

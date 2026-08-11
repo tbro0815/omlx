@@ -10,6 +10,7 @@ import pytest
 
 import omlx.process_memory_enforcer as pme
 import omlx.utils.psutil_compat as psutil_compat
+from omlx.engine.tts import TTSEngine
 from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
 
@@ -712,6 +713,7 @@ class TestDisabledWhenCeilingZero:
         scheduler = MagicMock(spec=[])
         scheduler._memory_limit_bytes = 0
         scheduler._memory_hard_limit_bytes = 0
+        scheduler._memory_hard_watermark_bytes = 0
         scheduler._memory_static_ceiling_bytes = 0
         scheduler._memory_dynamic_ceiling_bytes = 0
         scheduler._memory_metal_cap_bytes = 0
@@ -725,10 +727,60 @@ class TestDisabledWhenCeilingZero:
         enforcer._propagate_memory_limit()
 
         assert scheduler._memory_hard_limit_bytes == metal_b - hot_reserved_b
+        assert scheduler._memory_hard_watermark_bytes == int(
+            (metal_b - hot_reserved_b) * enforcer._hard_threshold
+        )
         assert scheduler._memory_static_ceiling_bytes == static_b
         assert scheduler._memory_dynamic_ceiling_bytes == dynamic_b
         assert scheduler._memory_metal_cap_bytes == metal_b
         assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
+
+    async def test_propagates_hot_cache_used_for_usage_side_exclusion(
+        self, mock_engine_pool
+    ):
+        """Targets whose usage read is raw phys_footprint (the DFlash primary
+        guard) need the used-bytes counterpart of the reservation, or the
+        hot cache is charged twice: once in the reserved ceiling, once in
+        phys. The enforcer propagates the exact used figure each tick."""
+        metal_b = 16 * 1024**3
+        hot_used_b = 3 * 1024**3
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: hot_used_b + 512 * 1024**2
+        enforcer._hot_cache_used_bytes = lambda: hot_used_b
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == hot_used_b
+
+    async def test_propagated_hot_cache_used_clamped_to_reservation(
+        self, mock_engine_pool
+    ):
+        """A transient overshoot (live hot-cache bytes past max_bytes) must not
+        exclude more usage than the reservation removed from the ceiling —
+        that would net-weaken the guard exactly under pressure."""
+        metal_b = 16 * 1024**3
+        reserved_b = 3 * 1024**3  # capped at max_bytes
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
+        enforcer._hot_cache_reserved_bytes = lambda: reserved_b
+        enforcer._hot_cache_used_bytes = lambda: 5 * 1024**3  # overshoot
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_hot_cache_used_bytes = 0
+        scheduler.batch_generator = None
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        mock_engine_pool._entries = {"model-a": entry}
+
+        enforcer._propagate_memory_limit()
+
+        assert scheduler._memory_hot_cache_used_bytes == reserved_b
 
 
 class TestPrefillMemoryGuardToggle:
@@ -1155,6 +1207,67 @@ class TestAbortLimitCalculation:
             engine_pool=mock_engine_pool, memory_guard_tier="extreme"
         )
         assert enforcer.memory_guard_tier == "balanced"
+
+
+class TestAdmissionCeiling:
+    """#2290: the pre-load admission ceiling survives disabling the guard."""
+
+    def test_guard_on_matches_final_ceiling(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        assert enforcer.get_admission_ceiling() == enforcer.get_final_ceiling()
+        assert enforcer.get_admission_ceiling() == 10 * 1024**3
+
+    def test_guard_off_falls_back_to_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_final_ceiling() == 0
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+    def test_guard_off_ignores_metal_cap(self, mock_engine_pool):
+        """Guard off leaves allocations pageable; the Metal cap must not
+        shrink the best-effort admission ceiling."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        enforcer._get_effective_metal_cap_bytes = lambda: 96 * 1024**3
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            assert enforcer.get_admission_ceiling() == 122 * 1024**3
+
+
+class TestAdmissionSoftTarget:
+    """#2319: pre-load eviction targets the soft watermark, not the ceiling."""
+
+    def test_guard_on_scales_admission_ceiling_by_soft_threshold(
+        self, mock_engine_pool
+    ):
+        enforcer = _make_enforcer(
+            mock_engine_pool, ceiling=10 * 1024**3, soft_threshold=0.9
+        )
+        assert enforcer.get_admission_soft_target() == int(10 * 1024**3 * 0.9)
+
+    def test_guard_off_scales_static_fallback(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="balanced",
+            prefill_memory_guard=False,
+        )
+        with patch("omlx.settings.get_system_memory") as mock_mem:
+            mock_mem.return_value = 128 * 1024**3
+            expected = int(122 * 1024**3 * enforcer._soft_threshold)
+            assert enforcer.get_admission_soft_target() == expected
+
+    def test_no_admission_ceiling_returns_zero(self, mock_engine_pool):
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=10 * 1024**3)
+        enforcer.get_admission_ceiling = lambda: 0
+        assert enforcer.get_admission_soft_target() == 0
 
 
 class TestMetalWiredLimit:
@@ -1774,6 +1887,28 @@ class TestUnresolvableSchedulerWarning:
             r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
         ]
         assert warnings == []
+
+    def test_non_streaming_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """TTS/STT/STS/Embedding/Reranker engines have no Scheduler by
+        design (they run on the MLX executor), so the wrapper-break
+        warning must not fire for them — it misreads as a memory guard
+        regression (#2312)."""
+        engine = TTSEngine("dummy-tts-model")
+        entry = _make_entry("model-tts", engine=engine)
+        enforcer._engine_pool._entries = {"model-tts": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == [], (
+            "Non-streaming engines must not trigger the unresolvable-"
+            f"scheduler warning, got {[r.message for r in warnings]}"
+        )
 
     def test_unresolvable_does_not_block_other_engines(self, enforcer):
         """If engine A is unresolvable but engine B has a real scheduler,

@@ -12,6 +12,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
+
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import (
@@ -1145,3 +1147,47 @@ class TestFirstChunkEvictionPreservesPrefix:
         assert req.block_table is block_table
         assert req.shared_prefix_blocks == 3
         sched.block_aware_cache.release_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _schedule_waiting(): specprefill guard defers everything while one is active
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleWaitingSpecPrefillGuard:
+    def test_second_specprefill_deferred_while_one_active(self):
+        """A second specprefill request must wait for the active one (#766).
+
+        Admitting it would replace the live _OffsetAdjustedRoPE on the shared
+        model and corrupt the remaining decode of the active request.
+        """
+        sched = _make_scheduler(chunked_prefill=False)
+        sched._specprefill_active_request_id = "active-req"
+
+        req = _make_request("spec-2", n_tokens=10)
+        req.specprefill_indices = mx.array([0, 2, 4])
+        sched.add_request(req)
+
+        with patch.object(sched, "_do_external_prefill") as mock_ep:
+            scheduled, rejected = sched._schedule_waiting()
+
+        mock_ep.assert_not_called()
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting
+
+    def test_normal_request_deferred_while_specprefill_active(self):
+        """Non-specprefill requests keep deferring while one is active."""
+        sched = _make_scheduler(chunked_prefill=False)
+        sched._specprefill_active_request_id = "active-req"
+
+        req = _make_request("normal", n_tokens=10)
+        sched.add_request(req)
+
+        with patch.object(sched, "_do_external_prefill") as mock_ep:
+            scheduled, rejected = sched._schedule_waiting()
+
+        mock_ep.assert_not_called()
+        assert scheduled == []
+        assert rejected == []
+        assert req in sched.waiting
