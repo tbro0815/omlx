@@ -320,6 +320,21 @@
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
 
+            // External (remote API) models state
+            extModels: [],
+            extDeleteConfirm: null,
+            extAddOpen: false,
+            extProvider: 'openrouter',
+            extBaseUrl: '',
+            extApiKey: '',
+            extCatalog: [],
+            extCatalogLoading: false,
+            extCatalogFilter: '',
+            extRemoteModel: '',
+            extDisplayName: '',
+            extError: '',
+            extAdding: false,
+
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
             hfRecommendedLoaded: false,
@@ -556,6 +571,7 @@
                 await Promise.all([
                     this.loadGlobalSettings(),
                     this.loadModels(),
+                    this.loadExternalModels(),
                     this.loadServerInfo(),
                     this.loadProfileFields(),
                     this.loadPresets(),
@@ -4363,6 +4379,135 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // ── External (remote API) models ──────────────────────────
+            async loadExternalModels() {
+                try {
+                    const response = await fetch('/admin/api/external-models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.extModels = data.models || [];
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (err) {
+                    console.error('Failed to load external models:', err);
+                }
+            },
+
+            openExtAdd() {
+                this.extAddOpen = true;
+                this.extError = '';
+                this.extProvider = 'openrouter';
+                this.extBaseUrl = '';
+                this.extApiKey = '';
+                this.extCatalog = [];
+                this.extCatalogFilter = '';
+                this.extRemoteModel = '';
+                this.extDisplayName = '';
+            },
+
+            extEffectiveBaseUrl() {
+                if (this.extProvider === 'openrouter') {
+                    return this.extBaseUrl || 'https://openrouter.ai/api/v1';
+                }
+                return this.extBaseUrl;
+            },
+
+            extFilteredCatalog() {
+                const q = this.extCatalogFilter.trim().toLowerCase();
+                if (!q) return this.extCatalog.slice(0, 400);
+                return this.extCatalog
+                    .filter(m => (m.id + ' ' + (m.name || '')).toLowerCase().includes(q))
+                    .slice(0, 400);
+            },
+
+            async loadExtCatalog() {
+                this.extError = '';
+                this.extCatalogLoading = true;
+                try {
+                    const response = await fetch('/admin/api/external-models/catalog', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: this.extProvider,
+                            base_url: this.extEffectiveBaseUrl(),
+                            api_key: this.extApiKey || undefined,
+                        }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        this.extError = data.detail || 'Could not load model list';
+                        this.extCatalog = [];
+                    } else {
+                        this.extCatalog = data.models || [];
+                        if (this.extCatalog.length === 0) {
+                            this.extError = 'Endpoint returned an empty model list';
+                        }
+                    }
+                } catch (err) {
+                    this.extError = 'Could not load model list: ' + err;
+                    this.extCatalog = [];
+                } finally {
+                    this.extCatalogLoading = false;
+                }
+            },
+
+            async addExternalModel() {
+                this.extError = '';
+                const remoteModel = this.extRemoteModel.trim();
+                if (!remoteModel) {
+                    this.extError = 'Pick a model from the list or enter a model ID';
+                    return;
+                }
+                if (this.extProvider === 'openai_compatible' && !this.extBaseUrl.trim()) {
+                    this.extError = 'Base URL is required for a generic endpoint';
+                    return;
+                }
+                this.extAdding = true;
+                try {
+                    const meta = this.extCatalog.find(m => m.id === remoteModel);
+                    const response = await fetch('/admin/api/external-models', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: this.extProvider,
+                            base_url: this.extEffectiveBaseUrl(),
+                            remote_model: remoteModel,
+                            display_name: this.extDisplayName.trim(),
+                            api_key: this.extApiKey || undefined,
+                            context_length: meta?.context_length ?? null,
+                            modality: meta?.modality ?? null,
+                        }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        this.extError = data.detail || 'Failed to add model';
+                        return;
+                    }
+                    this.extAddOpen = false;
+                    await Promise.all([this.loadExternalModels(), this.loadModels()]);
+                } catch (err) {
+                    this.extError = 'Failed to add model: ' + err;
+                } finally {
+                    this.extAdding = false;
+                }
+            },
+
+            async deleteExternalModel(modelId) {
+                this.extDeleteConfirm = null;
+                try {
+                    const response = await fetch(
+                        `/admin/api/external-models/${encodeURIComponent(modelId)}`,
+                        { method: 'DELETE' },
+                    );
+                    if (response.ok) {
+                        await Promise.all([this.loadExternalModels(), this.loadModels()]);
+                    }
+                } catch (err) {
+                    console.error('Failed to delete external model:', err);
                 }
             },
 
