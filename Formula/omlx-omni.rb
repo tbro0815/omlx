@@ -6,9 +6,9 @@ require_relative "omlx"
 class OmlxOmni < Omlx
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
-  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.5.1-omni.tar.gz"
-  version "0.5.1-omni"
-  sha256 "387d4f2a2386dc76ebacb89b70874122513aa4cb5e098ba9ad602881585cdc74"
+  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.5.3-omni.tar.gz"
+  version "0.5.3-omni"
+  sha256 "24bbf4b4a4292f5c9f379d716a8fdb7d606c18ec9a38c2a34963fc62db327f05"
 
   # Homebrew does not carry dependencies from a parent formula into a
   # separately-installed child formula.
