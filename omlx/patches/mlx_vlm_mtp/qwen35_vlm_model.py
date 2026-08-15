@@ -88,6 +88,21 @@ def apply() -> bool:
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
+        # An embedded DSpark drafter is a plain Qwen3 model whose RMSNorm
+        # gammas are already one-centered, unlike the Qwen3-Next backbone's
+        # zero-centered ones. Neither the global raw-HF rule nor the per-key
+        # mean heuristic applies — shifting them destroys the drafter.
+        is_dspark = any(
+            k.endswith(
+                (
+                    "mtp.hidden_norm.weight",
+                    "mtp.markov_head.markov_w1.weight",
+                    "mtp.markov_head.markov_w2.weight",
+                )
+            )
+            for k in weights
+        )
+
         norm_keys = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -128,7 +143,9 @@ def apply() -> bool:
             if value.ndim == 1 and any(key.endswith(sfx) for sfx in norm_keys):
                 # ``key`` is already remapped to ``language_model.mtp.*`` for
                 # MTP weights here, so test the ``mtp.`` substring.
-                if "mtp." in key:
+                if "mtp." in key and is_dspark:
+                    pass
+                elif "mtp." in key:
                     if should_shift_norm_weights:
                         # Raw-HF source: every Qwen3-Next RMSNorm gamma is
                         # zero-centered — shift head norms uniformly like

@@ -41,6 +41,19 @@ _REPAIR_GROUPS = {
 # broken ones measure 0.44-0.74 below.
 _REPAIR_MARGIN = 0.4
 
+# Markers that identify the payload's ``mtp.*`` tensors as an embedded DSpark
+# drafter rather than a Lightning MTP head. A DSpark drafter is a plain Qwen3
+# model: its RMSNorm gammas are stored one-centered, so they sit ~1 *below*
+# the Qwen3-Next backbone anchors this repair compares against and every one
+# of them would be "repaired" to +1 too high — which silently destroys the
+# drafter. Detection is structural (module names that only DSpark has), not
+# numeric, so it cannot be fooled by an unusual gamma distribution.
+_DSPARK_MARKERS = (
+    "mtp.hidden_norm.weight",
+    "mtp.markov_head.markov_w1.weight",
+    "mtp.markov_head.markov_w2.weight",
+)
+
 
 def _mean(v) -> float:
     import mlx.core as mx
@@ -59,6 +72,10 @@ def repair_legacy_head_norms(
     """
     is_list = not isinstance(weights, dict)
     items = list(weights.items()) if isinstance(weights, dict) else list(weights)
+
+    if any(k.endswith(_DSPARK_MARKERS) for k, _ in items):
+        # Embedded DSpark drafter: plain-Qwen3 norm convention, nothing to do.
+        return weights, 0
 
     head_indices: List[Tuple[int, str]] = []  # (item index, head suffix)
     for i, (k, v) in enumerate(items):

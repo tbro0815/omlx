@@ -345,11 +345,27 @@ def take_primed(
     the current unprimed behaviour.
     """
     # Hosts with their own priming shape (inkling's sliding-window
-    # multi-block fold) own the whole activation seam.
+    # multi-block fold, the embedded-DSpark context cache) own the whole
+    # activation seam. A hook may decline by returning ``NotImplemented``,
+    # in which case the generic fold below runs — that lets one class carry
+    # the hook for a head layout it only sometimes has (the qwen3_5
+    # TextModel is DSpark-shaped or Lightning-MTP-shaped per instance).
     for host in _host_candidates(model):
         hook = getattr(host, "mtp_take_primed", None)
         if callable(hook):
-            return hook(cache, main_tok)
+            result = hook(cache, main_tok)
+            if result is not NotImplemented:
+                return result
+            break
+    return take_primed_generic(model, cache, main_tok)
+
+
+def take_primed_generic(
+    model: Any,
+    cache: Optional[List[Any]],
+    main_tok: Any,
+) -> Optional[tuple]:
+    """The default seam fold, for hosts without their own priming shape."""
     ctx = _find_ctx(model)
     if ctx is None:
         return None
@@ -390,6 +406,7 @@ __all__ = [
     "suppress_capture",
     "maybe_capture",
     "take_primed",
+    "take_primed_generic",
     "drop_ctx",
     "prime_ctx_stats",
 ]

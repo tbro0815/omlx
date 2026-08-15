@@ -51,7 +51,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from . import prompt_priming
+from . import prompt_priming, qwen35_dspark
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,7 @@ def apply() -> bool:
 
     _patch_text_model_args(q35)
     _register_mtp_classes(q35)
+    qwen35_dspark.register(q35)
     _patch_gated_delta_net(q35)
     _patch_decoder_layer(q35)
     _patch_qwen3_5_text_model(q35)
@@ -131,6 +132,11 @@ def _patch_text_model_args(q35: Any) -> None:
         instance.mtp_num_hidden_layers = int(
             params.get("mtp_num_hidden_layers", 0) or 0
         )
+        # Same treatment for the embedded-DSpark declaration: the drafter's
+        # own architecture (layers / heads / head_dim / rope) is namespaced
+        # ``dspark_*`` in the target's config and would otherwise be filtered
+        # out by ``from_dict``'s field filter.
+        qwen35_dspark.carry_config(instance, params)
         return instance
 
     args_cls.from_dict = classmethod(patched_from_dict)
@@ -409,7 +415,10 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         cache=None,
         input_embeddings=None,
         n_confirmed: int = 0,
+        dspark_tap_ids=None,
     ):
+        import mlx.core as mx
+
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -421,10 +430,33 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Embedded DSpark taps: the drafter's context is the concatenation of
+        # the trunk's output at a fixed set of layers. Capturing them costs a
+        # reference each — no extra compute — and only happens when the caller
+        # asks. Simpler than DeepSeek-V4's equivalent, which additionally has
+        # to collapse a hyper-connection axis. The ids are passed in rather
+        # than stamped on the module: mlx's ``Module.__setattr__`` routes
+        # tuples into the module tree, and this is not part of the model.
+        ordered = tuple(dspark_tap_ids or ())
+        tap_ids = set(ordered)
+        taps = {}
+
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
+            )
+            if layer_idx in tap_ids:
+                taps[layer_idx] = hidden_states
+
+        if ordered:
+            if len(taps) != len(ordered):
+                raise RuntimeError(
+                    "DSpark target tap mismatch: "
+                    f"captured={len(taps)}, expected={len(ordered)}"
+                )
+            return hidden_states, mx.concatenate(
+                [taps[i] for i in ordered], axis=-1
             )
 
         # PR 990: return pre-norm hidden so the MTP head can fuse it. The
@@ -459,6 +491,7 @@ def _patch_text_model(q35: Any) -> None:
     def __init__(self, args):
         original_init(self, args)
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
+        is_dspark = qwen35_dspark.is_dspark_config(args)
         # Only attach the MTP head when the active-flag is set. With the
         # flag off the model is indistinguishable from a stock no-MTP
         # build: ``hasattr(self, "mtp")`` is False, sanitize strips
@@ -466,16 +499,41 @@ def _patch_text_model(q35: Any) -> None:
         # out because the inner ``language_model`` has no ``mtp``.
         from . import is_mtp_active
 
-        mtp_decode_enabled = bool(n_mtp > 0 and is_mtp_active())
+        mtp_decode_enabled = bool((n_mtp > 0 or is_dspark) and is_mtp_active())
         self._omlx_mtp_decode_enabled = mtp_decode_enabled
+        self._omlx_dspark_decode_enabled = bool(mtp_decode_enabled and is_dspark)
         if mtp_decode_enabled:
-            self.mtp = q35.MTPModule(args)
-            # Depth-k chained drafting is available on this model: the qwen
-            # patch supports return_hidden mtp_forward + partial rollback.
             from . import get_mtp_depth
 
+            if is_dspark:
+                self.mtp = qwen35_dspark.DSparkHead(args)
+                # DSpark drafts a whole block from one head forward, so the
+                # depth-k chain's per-step head re-entry does not apply; the
+                # dspark dispatch in batch_generator takes over. The context
+                # cache is committed-only (nothing speculative to trim), and
+                # it is a singleton the row-wise batch path cannot model.
+                self._omlx_mtp_head_clone = False
+                self._omlx_mtp_rowwise_unsupported = True
+                # The target is still a Qwen3.5 trunk, so its verify forward
+                # keeps the affine verify-qmm kernel (the DSpark opt-out in
+                # _call_backbone exists for the DeepSeek-V4 target).
+                self._omlx_dspark_verify_qmm = True
+                depth = qwen35_dspark.resolve_depth(args, get_mtp_depth())
+                logger.info(
+                    "Qwen3.5 speculative backend selected: embedded DSpark "
+                    "(%d layers, %d taps, block %d, draft width %d)",
+                    self.mtp.dspark_args.num_hidden_layers,
+                    len(self.mtp.dspark_args.target_layer_ids),
+                    self.mtp.dspark_args.block_size,
+                    depth,
+                )
+            else:
+                self.mtp = q35.MTPModule(args)
+                depth = get_mtp_depth()
+            # Depth-k chained drafting is available on this model: the qwen
+            # patch supports return_hidden mtp_forward + partial rollback.
             self._omlx_mtp_chain = True
-            self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth = depth
 
     def __call__(
         self,
@@ -485,6 +543,31 @@ def _patch_text_model(q35: Any) -> None:
         return_hidden: bool = False,
         n_confirmed: int = 0,
     ):
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            # DSpark's head input is the concatenation of trunk taps, not the
+            # final hidden — one extra returned tensor, same compute.
+            hidden, taps = self.model(
+                inputs,
+                cache,
+                input_embeddings=input_embeddings,
+                n_confirmed=n_confirmed,
+                dspark_tap_ids=self.mtp.dspark_args.target_layer_ids,
+            )
+            normed = self.model.norm(hidden)
+            if not return_hidden and not n_confirmed and input_embeddings is None:
+                try:
+                    qwen35_dspark.capture_prompt(self, inputs, taps, cache)
+                except Exception:
+                    logger.debug("DSpark prompt capture failed", exc_info=True)
+            out = (
+                self.model.embed_tokens.as_linear(normed)
+                if self.args.tie_word_embeddings
+                else self.lm_head(normed)
+            )
+            if return_hidden:
+                return out, taps
+            return out
+
         hidden = self.model(
             inputs,
             cache,
@@ -526,6 +609,22 @@ def _patch_text_model(q35: Any) -> None:
         final position, and the vocab is large enough (~250k) that skipping
         the other rows matters.
         """
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            # DSpark drafts a block in one shot; ``next_token_ids`` carries
+            # the anchor and its width is the requested draft length.
+            logits, hidden = self.dspark_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                draft_length=int(next_token_ids.shape[-1]),
+            )
+            if logits_keep and logits.shape[1] > logits_keep:
+                logits = logits[:, -logits_keep:]
+                hidden = hidden[:, -logits_keep:]
+            if return_hidden:
+                return logits, hidden
+            return logits
+
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -544,9 +643,21 @@ def _patch_text_model(q35: Any) -> None:
         return logits
 
     def make_mtp_cache(self):
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            return self.make_dspark_cache()
         if hasattr(self, "mtp"):
             return [KVCache() for _ in self.mtp.layers]
         return []
+
+    def mtp_take_primed(self, cache, main_token):
+        """Own the prompt-to-decode seam when this instance is DSpark-shaped.
+
+        Lightning MTP instances of the same class decline (``NotImplemented``)
+        and fall through to ``prompt_priming``'s generic fold.
+        """
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            return NotImplemented
+        return qwen35_dspark.take_primed(self, cache, main_token)
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Roll the backbone cache back to ``accepted`` drafts after a depth-k
@@ -650,8 +761,16 @@ def _patch_text_model(q35: Any) -> None:
             except Exception:
                 return _fallback
 
+        # An embedded DSpark drafter is a plain Qwen3 model: its RMSNorm
+        # gammas are already one-centered (mean ~1.0), unlike the Qwen3-Next
+        # backbone's zero-centered ones. Never shift them — neither the
+        # global raw-HF rule nor the per-key mean heuristic applies.
+        is_dspark = qwen35_dspark.is_dspark_config(self.args)
+
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        elif is_dspark:
+            pass
         elif not any("mtp." in k for k in weights):
             raise ValueError(
                 "Lightning MTP is enabled for this model but the converted "
@@ -684,6 +803,8 @@ def _patch_text_model(q35: Any) -> None:
                 # Note: keys may be prefixed (e.g. ``language_model.mtp.*``)
                 # when the outer Model wraps language_model, so test the
                 # ``mtp.`` substring rather than anchoring with startswith.
+                if "mtp." in k and is_dspark:
+                    continue
                 if "mtp." in k:
                     if should_shift_norm_weights:
                         # Raw-HF source: every Qwen3-Next RMSNorm gamma is
@@ -711,14 +832,25 @@ def _patch_text_model(q35: Any) -> None:
         def predicate(path, _):
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
-            # Keep the MTP fusion projection in full precision.
+            # Keep the MTP / DSpark fusion projection in full precision, and
+            # with it the DSpark markov + confidence heads: a 1x5376
+            # confidence projection and a rank-256 bigram table cost draft
+            # acceptance for no meaningful saving. Mirrors what
+            # ``tools/graft_dspark.py`` writes, and what the target's own
+            # vanilla head does (``mtp.fc.weight`` stays BF16 while its
+            # attention/MLP projections are packed).
             if path.endswith("mtp.fc"):
+                return False
+            if ".mtp." in f".{path}." and (
+                ".markov_head." in path or ".confidence_head." in path
+            ):
                 return False
             return True
 
         if (
             self.args.num_experts <= 0
             and int(getattr(self.args, "mtp_num_hidden_layers", 0) or 0) <= 0
+            and not qwen35_dspark.is_dspark_config(self.args)
         ):
             return None
         return predicate
@@ -730,9 +862,11 @@ def _patch_text_model(q35: Any) -> None:
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_take_primed = mtp_take_primed
     cls.mtp_partial_rollback = mtp_partial_rollback
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
+    qwen35_dspark.install_host_methods(cls)
 
 
 # ---------------------------------------------------------------------------

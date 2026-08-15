@@ -36,17 +36,30 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..mlx_lm_mtp import prompt_priming
+from ..mlx_lm_mtp import prompt_priming, qwen35_dspark
 
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
+
+
+def _dspark_prefill_capture_enabled() -> bool:
+    """Whether prefill forwards should capture DSpark taps for priming.
+
+    On by default. Off leaves the drafter unprimed — still correct, and still
+    correctly phased (the seam seeds the context cache at the target's
+    absolute offset), just context-starved until generated tokens accumulate.
+    """
+    return os.environ.get(
+        "OMLX_DSPARK_VLM_PREFILL_CAPTURE", "1"
+    ).strip().lower() not in ("0", "false", "off")
 
 
 def apply() -> bool:
@@ -64,6 +77,7 @@ def apply() -> bool:
 
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
+    qwen35_dspark.register(q35_lang)
     _patch_vlm_language_model(q35_lang)
     _patch_inner_model_capture(q35_lang)
     # VLMModelAdapter pass-throughs are installed by the MoE runtime patch
@@ -134,6 +148,9 @@ def _patch_text_config(q35_config: Any) -> None:
             )
         else:
             instance.mtp_num_hidden_layers = 0
+        # Embedded-DSpark declaration + the drafter's own architecture, which
+        # differs from the trunk in every dimension that matters.
+        qwen35_dspark.carry_config(instance, params)
         return instance
 
     cls.from_dict = classmethod(patched_from_dict)
@@ -242,12 +259,20 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
+        is_dspark = qwen35_dspark.is_dspark_config(args)
         attach_enabled = bool(is_mtp_attach_enabled())
         self._omlx_mtp_decode_enabled = bool(
-            n_mtp > 0 and attach_enabled and is_mtp_active()
+            (n_mtp > 0 or is_dspark) and attach_enabled and is_mtp_active()
         )
-        if n_mtp > 0 and attach_enabled:
-            self.mtp = q35_lang.MTPModule(args)
+        self._omlx_dspark_decode_enabled = bool(
+            self._omlx_mtp_decode_enabled and is_dspark
+        )
+        if (n_mtp > 0 or is_dspark) and attach_enabled:
+            self.mtp = (
+                qwen35_dspark.DSparkHead(args)
+                if is_dspark
+                else q35_lang.MTPModule(args)
+            )
         if self._omlx_mtp_decode_enabled:
             # Depth-k chained drafting works on this path: mtp_forward
             # supports return_hidden below, and rollback uses mlx-vlm's
@@ -255,7 +280,31 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             from ..mlx_lm_mtp import get_mtp_depth
 
             self._omlx_mtp_chain = True
-            self._omlx_mtp_depth = get_mtp_depth()
+            if is_dspark:
+                # DSpark drafts the whole block from one head forward, so the
+                # per-step chain re-entry is replaced by the dspark dispatch
+                # in batch_generator. Its context cache is a committed-only
+                # singleton: nothing speculative to trim, and the row-wise
+                # batch MTP path cannot model it.
+                self._omlx_mtp_head_clone = False
+                self._omlx_mtp_rowwise_unsupported = True
+                # Still a Qwen3.5 trunk: keep the affine verify-qmm kernel
+                # armed (the DSpark opt-out in _call_backbone exists for the
+                # DeepSeek-V4 target's own quantized linear path).
+                self._omlx_dspark_verify_qmm = True
+                self._omlx_mtp_depth = qwen35_dspark.resolve_depth(
+                    args, get_mtp_depth()
+                )
+                logger.info(
+                    "Qwen3.5 VLM speculative backend selected: embedded DSpark "
+                    "(%d layers, %d taps, block %d, draft width %d)",
+                    self.mtp.dspark_args.num_hidden_layers,
+                    len(self.mtp.dspark_args.target_layer_ids),
+                    self.mtp.dspark_args.block_size,
+                    self._omlx_mtp_depth,
+                )
+            else:
+                self._omlx_mtp_depth = get_mtp_depth()
             # Prompt-priming capture runs inside the inner Qwen3_5Model
             # forward, which has no reference back to this LanguageModel
             # (the mtp module / make_mtp_cache live here). A weakref avoids
@@ -282,22 +331,43 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # to avoid "got multiple values for keyword argument" when the caller
         # already passed capture_layer_ids.
         kwargs.pop("capture_layer_ids", None)
-        last_layer_idx = len(self.model.layers) - 1
+        # DSpark's head input is the concatenation of trunk taps rather than
+        # the final pre-norm hidden; the inner model already supports
+        # capturing arbitrary layers, so this is the same forward with a
+        # different capture set.
+        dspark = bool(getattr(self, "_omlx_dspark_decode_enabled", False))
+        if dspark:
+            taps = qwen35_dspark.target_layer_ids(self.args)
+            capture_ids = sorted(set(taps))
+        else:
+            capture_ids = [len(self.model.layers) - 1]
         out = original_call(
             self,
             inputs,
             inputs_embeds,
             mask,
             cache,
-            capture_layer_ids=[last_layer_idx],
+            capture_layer_ids=capture_ids,
             **kwargs,
         )
         from mlx_vlm.models.base import LanguageModelOutput
 
-        hidden_pre_norm = out.hidden_states[0]
+        if dspark:
+            captured = list(out.hidden_states or ())
+            if len(captured) != len(capture_ids):
+                raise RuntimeError(
+                    "DSpark target tap mismatch: "
+                    f"captured={len(captured)}, expected={len(capture_ids)}"
+                )
+            # ``hidden_sink`` is appended in ascending layer order; ``fc``
+            # expects the config's own tap order.
+            by_layer = dict(zip(capture_ids, captured))
+            head_hidden = mx.concatenate([by_layer[i] for i in taps], axis=-1)
+        else:
+            head_hidden = out.hidden_states[0]
         return LanguageModelOutput(
             logits=out.logits,
-            hidden_states=[hidden_pre_norm],
+            hidden_states=[head_hidden],
             gdn_states=out.gdn_states,
             shared_kv_states={} if return_shared_kv else None,
         )
@@ -313,6 +383,20 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
         chain contract: return_hidden yields the head's post-norm hidden for
         chaining; logits_keep limits the lm_head to the last N positions)."""
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            logits, hidden = self.dspark_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                draft_length=int(next_token_ids.shape[-1]),
+            )
+            if logits_keep and logits.shape[1] > logits_keep:
+                logits = logits[:, -logits_keep:]
+                hidden = hidden[:, -logits_keep:]
+            if return_hidden:
+                return logits, hidden
+            return logits
+
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -331,14 +415,28 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         return logits
 
     def make_mtp_cache(self):
+        if getattr(self, "_omlx_dspark_decode_enabled", False):
+            return self.make_dspark_cache()
         if hasattr(self, "mtp"):
             return [KVCache() for _ in self.mtp.layers]
         return []
+
+    def mtp_take_primed(self, cache, main_token):
+        """Own the prompt-to-decode seam when this instance is DSpark-shaped.
+
+        Lightning MTP instances of the same class decline (``NotImplemented``)
+        and fall through to ``prompt_priming``'s generic fold.
+        """
+        if not getattr(self, "_omlx_dspark_decode_enabled", False):
+            return NotImplemented
+        return qwen35_dspark.take_primed(self, cache, main_token)
 
     cls.__init__ = __init__
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    cls.mtp_take_primed = mtp_take_primed
+    qwen35_dspark.install_host_methods(cls)
     cls._omlx_mtp_runtime_patched = True
 
 
@@ -370,26 +468,85 @@ def _patch_inner_model_capture(q35_lang: Any) -> None:
     def __call__(
         self, inputs, inputs_embeds=None, mask=None, cache=None, *args, **kwargs
     ):
-        out = original_call(
-            self, inputs, inputs_embeds, mask, cache, *args, **kwargs
-        )
-        if (
+        eligible = (
             inputs_embeds is None
             and cache is not None
             and not args
             and kwargs.get("capture_layer_ids") is None
             and kwargs.get("hidden_sink") is None
             and kwargs.get("gdn_sink") is None
+        )
+        host_ref = getattr(self, "_omlx_mtp_prime_host", None) if eligible else None
+        host = host_ref() if host_ref is not None else None
+
+        # Embedded DSpark primes from trunk *taps*, which the plain forward
+        # does not compute a handle for — ask the inner model to capture them
+        # on the way through. Passing a hidden_sink bypasses the single-row
+        # batch-cache shortcut above the layer loop, which is why this is
+        # kill-switchable: the MTP verify path already runs that same
+        # capture-enabled shape on every cycle, but prefill does not.
+        dspark_taps = None
+        if (
+            host is not None
+            and getattr(host, "_omlx_dspark_decode_enabled", False)
+            and _dspark_prefill_capture_enabled()
         ):
-            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
-            host = host_ref() if host_ref is not None else None
-            if host is not None:
-                try:
-                    prompt_priming.maybe_capture(host, inputs, out, cache)
-                except Exception:
-                    logger.debug(
-                        "MTP prompt-priming capture failed", exc_info=True
+            dspark_taps = qwen35_dspark.target_layer_ids(host.args)
+
+        if dspark_taps:
+            capture_ids = sorted(set(dspark_taps))
+            sink: list = []
+            # The caller passes these three *explicitly as None* on a plain
+            # forward (``LanguageModel.__call__`` always forwards them), so
+            # the eligibility check above sees None while the keys are still
+            # in ``kwargs`` — re-supplying them here without dropping the
+            # originals raises "got multiple values for keyword argument".
+            # ``gdn_sink`` stays dropped: leaving it None keeps the trunk off
+            # its target_verify path for what is an ordinary prefill.
+            call_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k not in ("capture_layer_ids", "hidden_sink", "gdn_sink")
+            }
+            out = original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                *args,
+                capture_layer_ids=capture_ids,
+                hidden_sink=sink,
+                **call_kwargs,
+            )
+            try:
+                if len(sink) == len(capture_ids):
+                    by_layer = dict(zip(capture_ids, sink))
+                    taps = mx.concatenate(
+                        [by_layer[i] for i in dspark_taps], axis=-1
                     )
+                    qwen35_dspark.capture_prompt(host, inputs, taps, cache)
+                else:
+                    qwen35_dspark.drop_primed(host)
+            except Exception:
+                qwen35_dspark.drop_primed(host)
+                logger.debug("DSpark prompt capture failed", exc_info=True)
+            return out
+
+        out = original_call(
+            self, inputs, inputs_embeds, mask, cache, *args, **kwargs
+        )
+        # The generic fold is Lightning-MTP-shaped (hidden + next token
+        # through mtp_forward); a DSpark host must never enter it.
+        if host is not None and not getattr(
+            host, "_omlx_dspark_decode_enabled", False
+        ):
+            try:
+                prompt_priming.maybe_capture(host, inputs, out, cache)
+            except Exception:
+                logger.debug(
+                    "MTP prompt-priming capture failed", exc_info=True
+                )
         return out
 
     cls.__call__ = __call__

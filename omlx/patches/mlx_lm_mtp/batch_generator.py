@@ -1372,11 +1372,18 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
+    dspark_host = _dspark_host(model) if n_confirmed else None
+    dspark_verify = dspark_host is not None
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
-    # DeepSeek target on its architecture-native quantized linear path.
-    _set_verify_qmm_armed(not dspark_verify)
+    # DeepSeek target on its architecture-native quantized linear path — but a
+    # *Qwen* target running an embedded DSpark drafter is still a Qwen target,
+    # and its verify forward has the same shape the kernel gates on, so those
+    # hosts opt back in via ``_omlx_dspark_verify_qmm``.
+    _set_verify_qmm_armed(
+        not dspark_verify
+        or bool(getattr(dspark_host, "_omlx_dspark_verify_qmm", False))
+    )
     _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
