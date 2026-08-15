@@ -142,10 +142,11 @@ class AppleFMEngine(BaseEngine):
         try:
             import apple_fm_sdk as fm
         except ImportError as e:
+            from ..utils.install import get_venv_pip_command
+
             raise RuntimeError(
                 "apple-fm-sdk is not installed in the oMLX environment. "
-                "Install with: "
-                "\"$(brew --prefix omlx)/libexec/bin/pip\" install apple-fm-sdk "
+                f"Install with: {get_venv_pip_command()} install apple-fm-sdk "
                 "(requires macOS 26+, Xcode 26+ with the SDK agreement "
                 "accepted, and Apple Intelligence enabled)."
             ) from e

@@ -64,6 +64,53 @@ def is_homebrew() -> bool:
     return "/Cellar/" in prefix or "/homebrew/" in prefix
 
 
+def get_brew_formula_name(default: str = "omlx") -> str:
+    """Return the Homebrew formula name this install came from.
+
+    Read from the Cellar path (``/opt/homebrew/Cellar/<formula>/<version>/...``)
+    rather than assumed, because the formula is not always called ``omlx``:
+    the omni build installs as ``omlx-omni``, and a tap can carry several
+    formulae side by side. Hardcoding ``omlx`` makes every generated command —
+    ``brew services restart``, ``brew --prefix`` in install hints — fail with
+    "Formula `omlx` is not installed" or, worse, silently address a *different*
+    formula than the one that is running.
+
+    Falls back to *default* for non-Homebrew installs (pip, .app bundle),
+    where the value is only ever used to build a hint string.
+    """
+    parts = Path(sys.prefix).resolve().parts
+    try:
+        return parts[parts.index("Cellar") + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def get_brew_prefix() -> str:
+    """Return the Homebrew keg prefix (``.../Cellar/<formula>/<version>``).
+
+    Empty string when this is not a Homebrew install.
+    """
+    resolved = Path(sys.prefix).resolve()
+    parts = resolved.parts
+    try:
+        idx = parts.index("Cellar")
+    except ValueError:
+        return ""
+    return str(Path(*parts[: idx + 3]))
+
+
+def get_venv_pip_command() -> str:
+    """Shell-safe path to the pip that installs into *this* environment.
+
+    Used by "install X to use this feature" hints. On Homebrew that is the
+    keg's own venv pip, addressed through ``brew --prefix <formula>`` so the
+    command keeps working across version bumps.
+    """
+    if is_homebrew():
+        return f'"$(brew --prefix {get_brew_formula_name()})/libexec/bin/pip"'
+    return shlex.quote(str(Path(sys.prefix) / "bin" / "pip"))
+
+
 def get_install_method() -> str:
     """Return the installation method: 'dmg', 'homebrew', or 'pip'."""
     if is_app_bundle():

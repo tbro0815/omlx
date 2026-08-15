@@ -621,11 +621,18 @@ def _run_brew_services(command: str) -> int:
     import shutil
     import subprocess
 
+    from .utils.install import get_brew_formula_name
+
     brew = shutil.which("brew")
     if not brew:
         print("Homebrew is not available on PATH.")
         return 1
-    result = subprocess.run([brew, "services", command, "omlx"])
+    # Read the formula name off the Cellar path instead of assuming ``omlx``:
+    # the omni build installs as ``omlx-omni``, so a hardcoded name fails with
+    # "Formula `omlx` is not installed" — or, if a tap does carry a formula by
+    # that name, addresses the wrong one.
+    formula = get_brew_formula_name()
+    result = subprocess.run([brew, "services", command, formula])
     return result.returncode
 
 
