@@ -333,6 +333,12 @@ class EnginePool:
         # force a reload when the corresponding feature is disabled.
         mtp_active = bool(data.get("mtp_enabled", False))
         add("mtp_enabled", mtp_active)
+        if mtp_active:
+            # Draft depth is baked in at construction (set_mtp_depth runs
+            # pre-load and __init__ copies it onto the instance), so changing
+            # it has to force a reload rather than take effect on the next
+            # request.
+            add("mtp_num_draft_tokens", data.get("mtp_num_draft_tokens"))
 
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)

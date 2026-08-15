@@ -150,6 +150,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
+    mtp_num_draft_tokens: int | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
@@ -2473,6 +2474,25 @@ async def update_model_settings(
                     detail="MTP and DFlash cannot both be enabled; choose one speculative-decoding path.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+
+    if "mtp_num_draft_tokens" in sent:
+        # Maximum speculative depth; an adaptive controller picks 1..max per
+        # sequence. None / 0 restores the model-specific default. 8 is the
+        # ceiling the patch itself clamps to (``set_mtp_depth``), and an
+        # embedded-DSpark head clamps further to its trained block width.
+        depth = request.mtp_num_draft_tokens
+        if depth is None or int(depth) == 0:
+            current_settings.mtp_num_draft_tokens = None
+        elif not 1 <= int(depth) <= 8:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "mtp_num_draft_tokens must be between 1 and 8 "
+                    "(leave empty for the model-specific default)."
+                ),
+            )
+        else:
+            current_settings.mtp_num_draft_tokens = int(depth)
 
     # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
     if "vlm_mtp_enabled" in sent:
@@ -7014,13 +7034,15 @@ async def external_model_catalog(
         try:
             import apple_fm_sdk as fm
         except ImportError:
+            from ..utils.install import get_venv_pip_command
+
             raise HTTPException(
                 status_code=502,
                 detail=(
                     "apple-fm-sdk is not installed in the oMLX environment. "
-                    "Install with: \"$(brew --prefix omlx)/libexec/bin/pip\" "
-                    "install apple-fm-sdk (requires macOS 26+, Xcode 26+, "
-                    "Apple Intelligence enabled)."
+                    f"Install with: {get_venv_pip_command()} install "
+                    "apple-fm-sdk (requires macOS 26+, Xcode 26+ with the SDK "
+                    "agreement accepted, and Apple Intelligence enabled)."
                 ),
             )
         model = fm.SystemLanguageModel()

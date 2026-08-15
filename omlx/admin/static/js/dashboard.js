@@ -47,6 +47,7 @@
         'dflash_draft_sink_size',
         'dflash_verify_mode',
         'mtp_enabled',
+        'mtp_num_draft_tokens',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -1571,6 +1572,7 @@
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
                     dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
+                    mtp_num_draft_tokens: s.mtp_num_draft_tokens ?? null,
                     mtp_compatible: model?.mtp_compatible === true,
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
@@ -2141,6 +2143,10 @@
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
                                     : null,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                mtp_num_draft_tokens: this.modelSettings.mtp_enabled
+                                    && this.modelSettings.mtp_num_draft_tokens
+                                    ? parseInt(this.modelSettings.mtp_num_draft_tokens)
+                                    : null,
                                 vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
                                 vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
                                     ? (this.modelSettings.vlm_mtp_draft_model || null)
@@ -2189,6 +2195,7 @@
                                     dflash_draft_sink_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
+                                    mtp_num_draft_tokens: null,
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,

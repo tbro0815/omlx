@@ -563,6 +563,8 @@
   "modal.model_settings.turboquant_kv_bits_label": "每通道位元數",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
+  "modal.model_settings.mtp_draft_tokens": "最大草稿 token 數",
+  "modal.model_settings.mtp_draft_tokens_hint": "每個驗證週期的最大推測深度 (1-8)。自適應控制器依請求選擇 1~最大值。留空使用模型預設值。修改後會重新載入模型。",
   "modal.model_settings.mtp_conflict": "請先停用 DFlash 和 TurboQuant KV — 它們修補了 MTP 依賴的相同路徑。",
   "modal.model_settings.mtp_conflict_dflash": "請先停用 DFlash。",
   "modal.model_settings.mtplx_import": "匯入 MTP 側掛權重",

@@ -563,6 +563,8 @@
   "modal.model_settings.turboquant_kv_bits_label": "Битов на канал",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Использует встроенную MTP-голову модели для черновой генерации нескольких токенов за шаг. Декодирование до ~1,5× быстрее. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
+  "modal.model_settings.mtp_draft_tokens": "Макс. черновых токенов",
+  "modal.model_settings.mtp_draft_tokens_hint": "Максимальная спекулятивная глубина за цикл проверки (1-8). Адаптивный контроллер выбирает 1..max для каждого запроса. Пусто - значение по умолчанию для модели. Изменение перезагружает модель.",
   "modal.model_settings.mtp_conflict": "Сначала отключите DFlash и TurboQuant KV: они изменяют тот же путь, от которого зависит MTP.",
   "modal.model_settings.mtp_conflict_dflash": "Сначала отключите DFlash.",
   "modal.model_settings.mtplx_import": "Импортировать side-car MTP",

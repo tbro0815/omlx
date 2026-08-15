@@ -563,6 +563,8 @@
   "modal.model_settings.turboquant_kv_bits_label": "Bits por canal",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "Drafts several tokens per step with the model's built-in MTP head. Up to ~1.5x faster decoding. (Qwen 3.5/3.6, DeepSeek-V4, GLM-5.2)",
+  "modal.model_settings.mtp_draft_tokens": "Tokens de rascunho max.",
+  "modal.model_settings.mtp_draft_tokens_hint": "Profundidade especulativa maxima por ciclo de verificacao (1-8). Um controlador adaptativo escolhe 1..max por requisicao. Vazio = padrao do modelo. Alterar recarrega o modelo.",
   "modal.model_settings.mtp_conflict": "Desative o DFlash e o TurboQuant KV primeiro — eles modificam o mesmo caminho do qual o MTP depende.",
   "modal.model_settings.mtp_conflict_dflash": "Desative o DFlash primeiro.",
   "modal.model_settings.mtplx_import": "Importar side-car MTP",
