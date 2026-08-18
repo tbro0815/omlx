@@ -22,6 +22,17 @@ _RUNTIME_TEXT_PREFIX = "language_model.model."
 
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
+_REMOTE_CODE_METADATA_PATTERNS = [
+    "*.json",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
 # mlx_lm.load dropped trust_remote_code in some releases. Check once at
 # import time so call sites can pass it safely across versions.
 def _mlx_lm_load_accepts_trust_remote_code() -> bool:
@@ -35,8 +46,83 @@ def _mlx_lm_load_accepts_trust_remote_code() -> bool:
 _LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
 
 
+def ensure_model_code_trusted(
+    config: dict[str, Any],
+    *,
+    model_path: str | Path,
+    trust_remote_code: bool,
+) -> None:
+    """Reject a custom MLX architecture before any safetensors are opened."""
+
+    model_file = config.get("model_file")
+    if model_file is not None and not trust_remote_code:
+        raise ValueError(
+            f"The model at {model_path} requires importing and running a custom "
+            f"module ({model_file!r}) to build its architecture. This is disabled "
+            "by default. Enable Trust Remote Code for this model if you trust it."
+        )
+
+
+def preflight_text_remote_code(
+    path_or_repo: str,
+    *,
+    tokenizer_config: dict[str, Any] | None = None,
+    trust_remote_code: bool = False,
+) -> None:
+    """Resolve custom-code gates before mlx-lm starts loading model weights.
+
+    ``mlx_lm.load`` constructs and materialises the model before it creates the
+    tokenizer. A custom ``AutoTokenizer`` therefore used to reject an untrusted
+    repository only after a very large checkpoint was already resident. Read
+    metadata first and, only when it advertises custom Transformers code, ask
+    the real tokenizer loader to resolve the same trust decision up front.
+    """
+
+    if trust_remote_code:
+        return
+
+    from mlx_lm import utils as lm_utils
+
+    metadata_path = lm_utils._download(
+        path_or_repo,
+        allow_patterns=_REMOTE_CODE_METADATA_PATTERNS,
+    )
+    config = lm_utils.load_config(metadata_path)
+    ensure_model_code_trusted(
+        config,
+        model_path=metadata_path,
+        trust_remote_code=False,
+    )
+
+    def _read_json(name: str) -> dict[str, Any]:
+        try:
+            payload = json.loads((Path(metadata_path) / name).read_text())
+        except (OSError, TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    tokenizer_metadata = _read_json("tokenizer_config.json")
+    if not config.get("auto_map") and not tokenizer_metadata.get("auto_map"):
+        return
+
+    safe_tokenizer_config = dict(tokenizer_config or {})
+    # The per-model setting is authoritative. Never let a stale caller-provided
+    # dictionary opt into code execution behind the security toggle.
+    safe_tokenizer_config["trust_remote_code"] = False
+    lm_utils.load_tokenizer(
+        metadata_path,
+        safe_tokenizer_config,
+        eos_token_ids=config.get("eos_token_id"),
+    )
+
+
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
     """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    preflight_text_remote_code(
+        path_or_repo,
+        tokenizer_config=kwargs.get("tokenizer_config"),
+        trust_remote_code=trust_remote_code,
+    )
     from mlx_lm import load
     if _LM_LOAD_ACCEPTS_TRC:
         kwargs["trust_remote_code"] = trust_remote_code
@@ -93,6 +179,21 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     extras[proj_variant] = val
         if extras:
             quant.update(extras)
+        if str(cfg.get("model_type", "")).startswith("minimax_m3"):
+            # The mlx-lm adapter stores the vendored mlx-vlm tree under
+            # ``Model.inner`` and sanitize() re-roots checkpoint weights to
+            # the same path. MiniMax's MoE gates are 8-bit while the rest is
+            # 4-bit, so the per-layer override must follow that adapter root.
+            # Without it, an 8-bit packed gate is constructed as 4-bit and
+            # fails on the first token with weight (..., 1536), scales
+            # (..., 96), bits=4.
+            inner_extras = {
+                f"inner.{key}": val
+                for key, val in list(quant.items())
+                if isinstance(val, dict) and not key.startswith("inner.")
+            }
+            for key, val in inner_extras.items():
+                quant.setdefault(key, val)
     return cfg
 
 
@@ -424,6 +525,17 @@ def maybe_apply_pre_load_patches(
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
 
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
+    if not for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        # The mlx-lm side of the same model. A cluster rank is an
+        # ``mlx_lm.server``, so without this it cannot resolve the model type at
+        # all and MiniMax-M3 is unservable across Macs — see the patch docstring.
+        from ..patches.minimax_m3_mlx_lm import apply_minimax_m3_mlx_lm_patch
+
+        if apply_minimax_m3_mlx_lm_patch():
+            logger.info("MiniMax-M3 mlx-lm registration applied for %s", model_name)
+
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
     ):
@@ -522,7 +634,7 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
-            elif model_type == "gemma4":
+            elif model_type in ("gemma4", "gemma4_unified"):
                 # The fused multi-row verify kernel keeps gemma4 global-layer
                 # attention near-flat in L, so depths 4..8 are genuinely
                 # competitive on predictable text (26B code hit 1.89x at d4+
@@ -852,9 +964,9 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
     fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
-    Gemma 4 merged-assistant checkpoints (gemma4, VLM path only). The model
-    also has to declare MTP heads in the config; otherwise the patch is a
-    no-op.
+    Gemma 4 merged-assistant checkpoints (gemma4 and gemma4_unified, VLM path
+    only). The model also has to declare MTP heads in the config; otherwise
+    the patch is a no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -866,7 +978,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
-        or model_type == "gemma4"
+        or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
     )
@@ -1014,6 +1126,17 @@ def maybe_load_custom_quantization(
 
     if not quant_method:
         return None
+
+    if quant_method.lower() == "compressed-tensors":
+        from ..patches import qwen38_modelopt_mixed
+
+        if qwen38_modelopt_mixed.is_supported_config(config):
+            if not is_vlm:
+                raise ValueError(
+                    "The supported Qwen3.8 ModelOpt mixed checkpoint is a VLM; "
+                    "refusing the text-only fallback loader"
+                )
+            return qwen38_modelopt_mixed.load(model_name)
 
     if quant_method.lower() == "paroquant":
         try:

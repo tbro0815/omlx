@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from ..model_discovery import model_display_name
 from ..utils.proc_memory import get_lifetime_max_phys_footprint
 from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
@@ -51,6 +52,25 @@ class BenchmarkContextProfile(StrEnum):
     NOVEL_KO = "novel_ko"
     NOVEL_EN = "novel_en"
     NOVEL_JA = "novel_ja"
+
+
+class BenchmarkWarmupMode(StrEnum):
+    """How much of the local inference path to compile before measurement."""
+
+    QUICK = "quick"
+    ANE_2048 = "ane_2048"
+
+
+def _warmup_prompt_tokens(mode: BenchmarkWarmupMode | str) -> int:
+    """Return prompt length needed to execute the selected prefill warm-up.
+
+    Generation reserves the final prompt token for the first decode step, so a
+    2,048-token prefill requires a 2,049-token prompt.  Keeping that detail in
+    one helper prevents the UI's "2,048-token block" option from accidentally
+    warming only the 2,047-token GPU fallback shape.
+    """
+    normalized = BenchmarkWarmupMode(mode)
+    return 2049 if normalized is BenchmarkWarmupMode.ANE_2048 else 32
 
 
 @dataclass(frozen=True)
@@ -90,6 +110,7 @@ class BenchmarkRequest(BaseModel):
     generation_length: int = 128
     batch_sizes: list[int] = []
     context_profile: BenchmarkContextProfile = BenchmarkContextProfile.CODE_PYTHON
+    warmup_mode: BenchmarkWarmupMode = BenchmarkWarmupMode.QUICK
     force_lm_engine: bool = False
     # When set, the benchmark runs against a remote OpenAI-compatible
     # endpoint instead of a local engine and model_id is the remote
@@ -215,6 +236,12 @@ _FEATURE_FLAG_SPECS = (
     ),
     _FeatureFlagSpec("mtp_enabled", "mtp", "lightning_mtp", "Lightning MTP"),
     _FeatureFlagSpec("vlm_mtp_enabled", "vlm_mtp", "vlm_mtp", "VLM MTP"),
+    _FeatureFlagSpec(
+        "qwen35_ane_prefill_enabled",
+        "qwen35_ane_prefill",
+        "qwen35_ane_prefill",
+        "Qwen ANE Prefill",
+    ),
 )
 
 
@@ -325,6 +352,14 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
+    "qwen35_ane_prefill_enabled",
+    "qwen35_ane_prefill_sequence_length",
+    "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_max_layers",
+    "qwen35_ane_prefill_dual_ane",
+    "qwen35_ane_prefill_gdn",
+    "qwen35_ane_prefill_gdn_fraction",
+    "qwen35_ane_prefill_gdn_max_layers",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(
@@ -646,6 +681,7 @@ async def _run_single_test(
     prompt: list[int],
     max_tokens: int,
     pp_len: int,
+    ane_trace_config: dict[str, Any] | None = None,
 ) -> dict:
     """Run a single request benchmark test and return metrics."""
     if len(prompt) != pp_len:
@@ -665,32 +701,56 @@ async def _run_single_test(
     last_generated_token_time = None
     last_output = None
     prev_completion_tokens = 0
+    ane_profile_enabled = False
+    ane_profile: dict[str, dict[str, float]] = {}
 
-    async for output in engine.stream_generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=0.0,
-        top_p=1.0,
-        skip_cache_store=True,
-    ):
-        # Detect first generated token via completion_tokens count,
-        # not new_text. Some models (e.g. Harmony/gpt-oss) produce
-        # protocol tokens that don't yield visible new_text.
-        completion_delta = output.completion_tokens - prev_completion_tokens
-        if completion_delta > 0:
-            generated_at = getattr(output, "generated_at", None)
-            generated_until = getattr(output, "generated_until", None)
-            output_first_token_time = (
-                float(generated_at) if generated_at is not None else time.perf_counter()
-            )
-            if first_token_time is None:
-                first_token_time = output_first_token_time
-            if generated_until is not None:
-                last_generated_token_time = float(generated_until)
-            elif completion_delta == 1:
-                last_generated_token_time = output_first_token_time
-        prev_completion_tokens = output.completion_tokens
-        last_output = output
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        ane_profile_enabled = fast.qwen35_ane_profile_set_enabled(True)
+        if ane_profile_enabled:
+            fast.qwen35_ane_profile_reset()
+    except Exception:
+        logger.debug("Benchmark ANE profiler unavailable", exc_info=True)
+
+    try:
+        async for output in engine.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_p=1.0,
+            skip_cache_store=True,
+            benchmark_trace=True,
+            benchmark_ane_sequence_length=int(
+                (ane_trace_config or {}).get("sequence_length", 0) or 0
+            ),
+        ):
+            # Detect first generated token via completion_tokens count,
+            # not new_text. Some models (e.g. Harmony/gpt-oss) produce
+            # protocol tokens that don't yield visible new_text.
+            completion_delta = output.completion_tokens - prev_completion_tokens
+            if completion_delta > 0:
+                generated_at = getattr(output, "generated_at", None)
+                generated_until = getattr(output, "generated_until", None)
+                output_first_token_time = (
+                    float(generated_at)
+                    if generated_at is not None
+                    else time.perf_counter()
+                )
+                if first_token_time is None:
+                    first_token_time = output_first_token_time
+                if generated_until is not None:
+                    last_generated_token_time = float(generated_until)
+                elif completion_delta == 1:
+                    last_generated_token_time = output_first_token_time
+            prev_completion_tokens = output.completion_tokens
+            last_output = output
+    finally:
+        if ane_profile_enabled:
+            try:
+                ane_profile = fast.qwen35_ane_profile_snapshot()
+            finally:
+                fast.qwen35_ane_profile_set_enabled(False)
 
     end_time = time.perf_counter()
 
@@ -762,6 +822,17 @@ async def _run_single_test(
     else:
         generation_measured = generation_duration_s is not None
 
+    trace_prefill_duration_s = prefill_duration_s
+    if trace_prefill_duration_s is None and first_token_time is not None:
+        trace_prefill_duration_s = max(0.0, first_token_time - start_time)
+
+    _log_ane_benchmark_trace(
+        pp_len=pp_len,
+        prefill_duration_s=trace_prefill_duration_s,
+        config=ane_trace_config,
+        profile=ane_profile,
+    )
+
     return _compute_single_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=metric_completion_tokens,
@@ -774,6 +845,92 @@ async def _run_single_test(
         generation_duration_s=generation_duration_s,
         generation_measured=generation_measured,
     )
+
+
+def _log_ane_benchmark_trace(
+    *,
+    pp_len: int,
+    prefill_duration_s: float | None,
+    config: dict[str, Any] | None,
+    profile: dict[str, dict[str, float]],
+) -> None:
+    """Log an offline-comparable ANE/scheduler summary for one PP trial."""
+    config = config or {}
+    sequence_length = int(config.get("sequence_length", 0) or 0)
+    prefill_tokens = max(0, pp_len - 1)
+    full_shapes, tail = (0, prefill_tokens)
+    if sequence_length > 0:
+        full_shapes, tail = divmod(prefill_tokens, sequence_length)
+    logger.info(
+        "[benchmark-ane-summary] pp=%d prefill_tokens=%d sequence_length=%d "
+        "expected_full_shapes=%d gpu_tail_tokens=%d measured_prefill_ms=%s",
+        pp_len,
+        prefill_tokens,
+        sequence_length,
+        full_shapes,
+        tail,
+        (
+            f"{prefill_duration_s * 1000.0:.3f}"
+            if prefill_duration_s is not None
+            else "unknown"
+        ),
+    )
+
+    for category, layer_key, compiled_key in (
+        ("mlp", "mlp_layers", "compiled_mlp_layers"),
+        ("gdn", "gdn_layers", "compiled_gdn_layers"),
+    ):
+        values = profile.get(category, {})
+        operations = int(values.get("operations", 0) or 0)
+        configured_layers = int(config.get(layer_key, 0) or 0)
+        compiled_value = config.get(compiled_key)
+        compiled_layers = (
+            None if compiled_value is None else int(compiled_value)
+        )
+        # Expectations follow what the patch actually compiled; the settings
+        # value is only the fallback when the runtime state is unknown.
+        layers = (
+            compiled_layers if compiled_layers is not None else configured_layers
+        )
+        observed_shapes = operations / layers if layers > 0 else 0.0
+        expected_operations = full_shapes * layers
+        per_op = max(operations, 1)
+        elapsed_ns = (
+            prefill_duration_s * 1e9
+            if prefill_duration_s is not None and prefill_duration_s > 0
+            else 0.0
+        )
+        logger.info(
+            "[benchmark-ane-profile] pp=%d category=%s operations=%d "
+            "configured_layers=%d compiled_layers=%s expected_operations=%d "
+            "observed_shapes=%.3f input_ready_ms_per_op=%.3f "
+            "ane_region_ms_per_op=%.3f ane0_eval_ms_per_op=%.3f "
+            "ane1_eval_ms_per_op=%.3f gpu_qmm_ms_per_op=%.3f "
+            "gap_before_ms_per_op=%.3f ane0_duty=%.4f ane1_duty=%.4f",
+            pp_len,
+            category,
+            operations,
+            configured_layers,
+            "unknown" if compiled_layers is None else compiled_layers,
+            expected_operations,
+            observed_shapes,
+            float(values.get("pack_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane_region_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane0_eval_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("ane1_eval_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("gpu_qmm_ns", 0.0) or 0.0) / per_op / 1e6,
+            float(values.get("gap_before_ns", 0.0) or 0.0) / per_op / 1e6,
+            (
+                float(values.get("ane0_eval_ns", 0.0) or 0.0) / elapsed_ns
+                if elapsed_ns
+                else 0.0
+            ),
+            (
+                float(values.get("ane1_eval_ns", 0.0) or 0.0) / elapsed_ns
+                if elapsed_ns
+                else 0.0
+            ),
+        )
 
 
 async def _run_batch_test(
@@ -1055,6 +1212,33 @@ def _upload_model_name(model_id: str) -> str:
     """
     name = model_id.rstrip("/").split("/")[-1]
     return name[:_MAX_MODEL_NAME_LEN]
+
+
+def _upload_model_repo(
+    model_id: str, entry: Any = None, model_dirs: Any = None
+) -> Optional[str]:
+    """Org-qualified repo id to publish alongside the model name (#1808).
+
+    Uses the same derivation as the models UI display name: the HF repo id
+    when known, otherwise the org/leaf relative path under a configured
+    model dir. Returns None when nothing beyond the bare model id can be
+    derived (flat layouts), so the site simply shows no repo for those rows.
+    """
+    if entry is None:
+        return None
+    try:
+        derived = model_display_name(
+            model_id,
+            getattr(entry, "model_path", None),
+            list(model_dirs or []),
+            source_repo_id=getattr(entry, "source_repo_id", None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Benchmark: repo derivation failed: {e}")
+        return None
+    if not isinstance(derived, str) or derived == model_id or "/" not in derived:
+        return None
+    return derived[:_MAX_MODEL_NAME_LEN]
 
 
 def _sanitize_upload_error(resp: Any) -> str:
@@ -1508,14 +1692,20 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             },
         )
-        # VLM MTP requires VLMBatchedEngine (which has set_vlm_mtp_drafter),
-        # so don't force LM-only loading when VLM MTP is enabled.
-        vlm_mtp_active = (
+        # Both external VLM MTP and Lightning MTP on merged VLM checkpoints
+        # require VLMBatchedEngine. Text-only Lightning MTP models still
+        # resolve to BatchedEngine through their natural engine type.
+        external_vlm_mtp_active = (
             model_settings is not None
             and getattr(model_settings, "vlm_mtp_enabled", False)
             and getattr(model_settings, "vlm_mtp_draft_model", None)
         )
-        force_lm = True if request.force_lm_engine else not vlm_mtp_active
+        lightning_mtp_active = model_settings is not None and getattr(
+            model_settings, "mtp_enabled", False
+        )
+        force_lm = request.force_lm_engine or not (
+            external_vlm_mtp_active or lightning_mtp_active
+        )
         engine = await engine_pool.get_engine(
             request.model_id,
             force_lm=force_lm,
@@ -1554,7 +1744,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             },
         )
-        warmup_prompt = _generate_prompt(tokenizer, 32, request.context_profile)
+        warmup_started = time.perf_counter()
+        warmup_prompt_tokens = _warmup_prompt_tokens(request.warmup_mode)
+        warmup_prefill_tokens = warmup_prompt_tokens - 1
+        warmup_prompt = _generate_prompt(
+            tokenizer,
+            warmup_prompt_tokens,
+            request.context_profile,
+        )
         warmup_max_tokens = (
             request.generation_length
             if getattr(engine, "is_diffusion_model", False)
@@ -1564,7 +1761,13 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             prompt=warmup_prompt, max_tokens=warmup_max_tokens, temperature=0.0
         ):
             pass
-        logger.info("Benchmark: warmup complete")
+        logger.info(
+            "Benchmark: warmup complete "
+            f"(mode={request.warmup_mode.value}, "
+            f"prompt_tokens={warmup_prompt_tokens}, "
+            f"prefill_tokens={warmup_prefill_tokens}, "
+            f"wall_ms={(time.perf_counter() - warmup_started) * 1000.0:.3f})"
+        )
 
         # Start host sampling after warmup: Metal shader and JIT compilation
         # would otherwise be folded into the CPU aggregates.
@@ -1578,6 +1781,87 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         # Phase 3: Single request tests
         single_pp1024_gen_tps = None
+        ane_trace_config: dict[str, Any] | None = None
+        if model_settings is not None and getattr(
+            model_settings, "qwen35_ane_prefill_enabled", False
+        ):
+            gdn_enabled = bool(
+                getattr(model_settings, "qwen35_ane_prefill_gdn", False)
+            )
+            # The settings flag only records intent. The load-time patch stores
+            # what it actually compiled on the model, so the trace and the
+            # uploaded metadata reflect the runtime state (the patch can find
+            # no eligible layers or drop layers at the program budget).
+            loaded_model = getattr(engine, "_model", None)
+            compiled_mlp = getattr(
+                loaded_model, "_omlx_ane_mlp_prefill_count", None
+            )
+            compiled_gdn = getattr(
+                loaded_model, "_omlx_ane_gdn_prefill_count", None
+            )
+            ane_active = bool(compiled_mlp or compiled_gdn)
+            ane_trace_config = {
+                "sequence_length": int(
+                    getattr(
+                        model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                ),
+                "mlp_layers": int(
+                    getattr(model_settings, "qwen35_ane_prefill_max_layers", 0)
+                ),
+                "gdn_layers": (
+                    int(
+                        getattr(
+                            model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            0,
+                        )
+                    )
+                    if gdn_enabled
+                    else 0
+                ),
+                "compiled_mlp_layers": (
+                    None if compiled_mlp is None else int(compiled_mlp)
+                ),
+                "compiled_gdn_layers": (
+                    None if compiled_gdn is None else int(compiled_gdn)
+                ),
+                "active": ane_active,
+            }
+            if not ane_active:
+                run.feature_flags = [
+                    flag
+                    for flag in run.feature_flags
+                    if flag.get("key") != "qwen35_ane_prefill"
+                ]
+                run.experimental_features = [
+                    feature
+                    for feature in run.experimental_features
+                    if feature != "qwen35_ane_prefill"
+                ]
+                logger.info(
+                    "Qwen ANE prefill is enabled in settings but inactive at "
+                    "runtime; benchmark metadata reports it as off"
+                )
+        logger.info(
+            "[benchmark-ane-config] model=%s enabled=%s config=%s",
+            request.model_id,
+            ane_trace_config is not None,
+            ane_trace_config,
+        )
+        scheduler_config = getattr(engine_pool, "_scheduler_config", None)
+        logger.info(
+            "[benchmark-scheduler-config] prefill_step_size=%s "
+            "chunked_prefill=%s speed_priority=%s paged_cache_block_size=%s "
+            "max_num_batched_tokens=%s",
+            getattr(scheduler_config, "prefill_step_size", None),
+            getattr(scheduler_config, "chunked_prefill", None),
+            getattr(scheduler_config, "prefill_speed_priority", None),
+            getattr(scheduler_config, "paged_cache_block_size", None),
+            getattr(scheduler_config, "max_num_batched_tokens", None),
+        )
 
         for pp_len in request.prompt_lengths:
             current_test += 1
@@ -1600,8 +1884,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 prompt=prompts[pp_len],
                 max_tokens=request.generation_length,
                 pp_len=pp_len,
+                ane_trace_config=ane_trace_config,
             )
             metrics["system_metrics"] = _sample_window(run, window_start)
+            logger.info(
+                "[benchmark-pp-result] pp=%d processing_tps=%.3f "
+                "ttft_ms=%.3f e2e_ms=%.3f cached_tokens=%d",
+                pp_len,
+                float(metrics.get("processing_tps", 0.0) or 0.0),
+                float(metrics.get("ttft_ms", 0.0) or 0.0),
+                float(metrics.get("e2e_latency_s", 0.0) or 0.0) * 1000.0,
+                int(metrics.get("cached_tokens", 0) or 0),
+            )
 
             result = {
                 "test_type": "single",
@@ -1788,13 +2082,19 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
             messages=[
                 {
                     "role": "user",
-                    "content": _generate_external_prompt(32, request.context_profile),
+                    "content": _generate_external_prompt(
+                        _warmup_prompt_tokens(request.warmup_mode),
+                        request.context_profile,
+                    ),
                 }
             ],
             max_tokens=8,
             temperature=0.0,
         )
-        logger.info("Benchmark: external endpoint warmup complete")
+        logger.info(
+            "Benchmark: external endpoint warmup complete "
+            f"(mode={request.warmup_mode.value})"
+        )
 
         # Single request tests
         for pp_len in request.prompt_lengths:

@@ -1744,12 +1744,14 @@ class TestBatchGeneratorDispatch:
         class _FakeCache:
             def __init__(self):
                 self.offset = 0
+                self._mtp_undo = None
 
         def fake_rebuild(model):
             return [_FakeCache()]
 
         def fake_backbone(model, inputs, cache, n_confirmed=0):
             cache[0].offset = int(inputs.shape[1])
+            cache[0]._mtp_undo = object()
             arr = np.full((1, int(inputs.shape[1]), vocab), -10.0, dtype=np.float32)
             arr[0, -1, 5] = 10.0  # last-position argmax -> token 5
             return mx.array(arr), None, None
@@ -1801,6 +1803,7 @@ class TestBatchGeneratorDispatch:
         assert 42 not in batch.tokens[0]
         # cache rebuilt to contain exactly the streamed tokens
         assert batch.prompt_cache[0].offset == 4
+        assert batch.prompt_cache[0]._mtp_undo is None
 
     def test_reconcile_empty_queue_samples_from_logits(self, monkeypatch):
         bg, batch, state = self._make_reconcile_batch(
@@ -1926,6 +1929,15 @@ class TestMtpCompatibilityHelpers:
         assert (
             _is_mtp_compatible({"num_nextn_predict_layers": 1}, "deepseek_v4") is True
         )
+
+    def test_is_mtp_compatible_gemma4_unified(self):
+        config = {
+            "text_config": {
+                "mtp_num_hidden_layers": 4,
+                "mtp_assistant_config": {"model_type": "gemma4_unified_assistant"},
+            }
+        }
+        assert _is_mtp_compatible(config, "gemma4_unified") is True
 
     def test_is_mtp_compatible_llama_rejected(self):
         assert _is_mtp_compatible({"mtp_num_hidden_layers": 1}, "llama") is False
@@ -2337,9 +2349,9 @@ class TestRestoreOrTrimAtomicity:
 
 class TestRotatingCacheMtpUndo:
     """A rotated RotatingKVCache cannot trim, so MTP draft rejection needs
-    the armed one-update undo log: restore the pre-verify references and
-    replay the confirmed token. Equivalence is checked against a reference
-    cache that never saw the rejected draft."""
+    the armed verify-block undo log: restore the pre-verify state and replay
+    the confirmed/accepted prefix. Equivalence is checked against a reference
+    cache that never saw the rejected positions."""
 
     @staticmethod
     def _fill(cache, n, dim=4, start=0):
@@ -2349,7 +2361,7 @@ class TestRotatingCacheMtpUndo:
             k = mx.full((1, 1, 1, dim), float(i))
             cache.update_and_fetch(k, k)
 
-    def _run_equivalence(self, make_cache):
+    def _run_equivalence(self, make_cache, num_drafts=1):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -2361,18 +2373,22 @@ class TestRotatingCacheMtpUndo:
         self._fill(cache, 12)
         self._fill(ref, 12)
 
-        confirmed = mx.full((1, 1, 1, 4), 100.0)
-        draft = mx.full((1, 1, 1, 4), 200.0)
-        both = mx.concatenate([confirmed, draft], axis=2)
+        verify_steps = num_drafts + 1
+        verify = mx.broadcast_to(
+            mx.arange(100, 100 + verify_steps, dtype=mx.float32).reshape(
+                1, 1, verify_steps, 1
+            ),
+            (1, 1, verify_steps, 4),
+        )
         cache_rollback.set_undo_armed(True)
         try:
-            cache.update_and_fetch(both, both)
+            cache.update_and_fetch(verify, verify)
         finally:
             cache_rollback.set_undo_armed(False)
         assert cache.is_trimmable()
-        assert cache.trim(1) == 1
+        assert cache.trim(num_drafts) == num_drafts
 
-        ref.update_and_fetch(confirmed, confirmed)
+        ref.update_and_fetch(verify[..., :1, :], verify[..., :1, :])
 
         nxt = mx.full((1, 1, 1, 4), 300.0)
         ck, cv = cache.update_and_fetch(nxt, nxt)
@@ -2380,6 +2396,7 @@ class TestRotatingCacheMtpUndo:
         mx.eval(ck, cv, rk, rv)
         assert mx.array_equal(ck, rk).item()
         assert mx.array_equal(cv, rv).item()
+        assert cache.meta_state == ref.meta_state
         c_off = cache.offset
         r_off = ref.offset
         if hasattr(c_off, "tolist"):
@@ -2396,6 +2413,18 @@ class TestRotatingCacheMtpUndo:
         from mlx_lm.models.cache import BatchRotatingKVCache
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]))
+
+    def test_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        # Depth-8 contains one confirmed token plus eight drafts. The old gate
+        # admitted at most eight positions, excluding this nine-position update.
+        self._run_equivalence(lambda: RotatingKVCache(max_size=8), num_drafts=8)
+
+    def test_batch_rotating_kv_cache_depth_eight_verify_undo(self):
+        from mlx_lm.models.cache import BatchRotatingKVCache
+
+        self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
@@ -2475,3 +2504,144 @@ class TestParkedScopePerSequence:
         _record_std_tax_sample(gb, 10.0)
         assert not hasattr(gb, "_omlx_mtp_tax_probe")
         assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+
+@pytest.fixture(autouse=True)
+def _quiet_prefill_tracker():
+    """Loop-tax probes consult the process-global prefill tracker; keep
+    every test in this module hermetic against activity left behind by
+    other suites (or by earlier tests here)."""
+    from omlx.prefill_progress import get_prefill_tracker
+
+    get_prefill_tracker().clear()
+    yield
+    get_prefill_tracker().clear()
+
+
+class TestLoopTaxHygiene:
+    """#2622: park probes must not latch contention-shaped timings.
+
+    A park that fires while another request is prefilling (any engine on
+    the shared GPU) measures a contention-inflated t0; if the std samples
+    then run after the contention ends, the t0/t_std ratio poisons
+    ``model._omlx_mtp_loop_tax`` and every later sequence exits MTP
+    against an inflated margin until restart.
+    """
+
+    def _fake_batch(self, uids):
+        return SimpleNamespace(model=SimpleNamespace(), uids=list(uids))
+
+    def _tracker(self):
+        from omlx.prefill_progress import get_prefill_tracker
+
+        return get_prefill_tracker()
+
+    def _drain_probe(self, gb, std_ms=10.0):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _record_std_tax_sample,
+        )
+
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES):
+            _record_std_tax_sample(gb, std_ms)
+
+    def test_probe_not_armed_while_prefill_live(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        self._tracker().update("r1", 10, 100, "modelA")
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_not_armed_right_after_prefill_end(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        tracker = self._tracker()
+        tracker.update("r1", 10, 100, "modelA")
+        tracker.update("r1", 100, 100, "modelA")  # completes, entry popped
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_probe_discarded_when_prefill_ran_during_sampling(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES - 1):
+            _record_std_tax_sample(gb, 10.0)
+        # A prefill starts (and would end) inside the sampling window: the
+        # finalize step must throw the whole probe away.
+        self._tracker().update("r2", 10, 100, "modelB")
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+    def test_clean_probe_still_latches_with_timestamp(self):
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7)
+        self._drain_probe(gb)
+        assert gb.model._omlx_mtp_loop_tax == pytest.approx(1.5)
+        assert hasattr(gb.model, "_omlx_mtp_loop_tax_ts")
+
+    def test_tax_log_level_by_threshold(self, caplog):
+        import logging
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        logger_name = "omlx.patches.mlx_lm_mtp.batch_generator"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            gb = self._fake_batch([7])
+            _arm_std_tax_probe(gb, 15.0, uid=7)
+            self._drain_probe(gb)  # tax 1.5 >= warn threshold
+            assert any(
+                "MTP loop tax measured" in r.message
+                and r.levelno == logging.INFO
+                for r in caplog.records
+            )
+            caplog.clear()
+            gb2 = self._fake_batch([8])
+            _arm_std_tax_probe(gb2, 11.0, uid=8)
+            self._drain_probe(gb2)  # tax 1.1 < warn threshold -> DEBUG only
+            assert not any(
+                "MTP loop tax measured" in r.message for r in caplog.records
+            )
+
+    def test_effective_loop_tax_decays_toward_default(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_DECAY_S,
+            _DepthController,
+            _effective_loop_tax,
+        )
+
+        model = SimpleNamespace()
+        assert _effective_loop_tax(model) is None
+        model._omlx_mtp_loop_tax = 1.5
+        # Legacy attribute without a timestamp passes through unchanged.
+        assert _effective_loop_tax(model) == pytest.approx(1.5)
+        model._omlx_mtp_loop_tax_ts = time.monotonic()
+        assert _effective_loop_tax(model) == pytest.approx(1.5, abs=0.01)
+        model._omlx_mtp_loop_tax_ts = time.monotonic() - 3 * _STD_TAX_DECAY_S
+        aged = _effective_loop_tax(model)
+        assert _DepthController.EXIT_MARGIN <= aged < 1.2
+
+    def test_recently_active_window(self):
+        tracker = self._tracker()
+        assert not tracker.recently_active(3.0)
+        tracker.update("r1", 10, 100, "m")
+        assert tracker.recently_active(3.0)
+        tracker.update("r1", 100, 100, "m")
+        assert tracker.recently_active(3.0)  # just-finished counts
+        tracker.clear()
+        assert not tracker.recently_active(3.0)

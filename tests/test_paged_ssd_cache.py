@@ -1698,6 +1698,62 @@ class TestAsyncWriteAndTimeoutLoad:
         assert metadata["model_name"] == "test-model"
         assert metadata["layer_cache_types"] == ["KVCache"]
 
+    def test_pending_write_read_promotes_to_hot_cache(self, tmp_path, mx):
+        """Promotion must not depend on the SSD writer winning a race."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "pending_promotion",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=10 * 1024**2,
+        )
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            writer_entered.set()
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        block_hash = b"pending_promote_hash"
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))]
+
+        try:
+            assert manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                layer_meta_states=[(16,)],
+                hot_cache_write_back=False,
+            )
+            assert writer_entered.wait(timeout=5)
+            assert manager.get_stats().hot_cache_entries == 0
+
+            loaded_data, metadata = manager.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=True,
+            )
+
+            assert loaded_data is not None
+            assert metadata is not None
+            assert manager.get_stats().hot_cache_entries == 1
+            assert manager.get_stats().hot_cache_promotions == 1
+
+            release_writer.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with manager._pending_write_hashes_lock:
+                    if block_hash not in manager._pending_write_hashes:
+                        break
+                time.sleep(0.01)
+            with manager._hot_cache_lock:
+                assert manager._hot_cache[block_hash]["dirty"] is False
+        finally:
+            release_writer.set()
+            manager.close()
+
     def test_load_error_returns_none(self, ssd_cache, mx):
         """Verify that a corrupted file returns None and cleans up index."""
         block_hash = b"error_test_hash_1234"
@@ -2454,6 +2510,84 @@ class TestPreloadMatchedBlocks:
             assert manager2._hot_cache_get(h) is not None
 
         manager2.close()
+
+    def test_load_promotion_failure_counts_and_warns(self, tmp_path, mx, caplog):
+        """A failed promotion is surfaced in stats and a throttled warning."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        try:
+            with (
+                patch.object(
+                    manager2, "_hot_cache_put", side_effect=RuntimeError("boom")
+                ),
+                caplog.at_level(logging.WARNING),
+            ):
+                assert manager2.load_block(hashes[0]) is not None
+
+            stats = manager2.get_stats()
+            assert stats.hot_cache_promotions == 0
+            assert stats.hot_cache_promotion_failures == 1
+            assert manager2._hot_cache_get(hashes[0]) is None
+            assert "Hot cache promotion failed" in caplog.text
+        finally:
+            manager2.close()
+
+    def test_pending_promotion_failure_counts(self, tmp_path, mx):
+        """Pending-buffer promotion failures are counted, disabled tier is not."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        try:
+            entry = {"tensors_raw": {}, "block_metadata": None}
+            with patch.object(
+                manager, "_hot_cache_put", side_effect=RuntimeError("boom")
+            ):
+                assert (
+                    manager._promote_pending_write_to_hot_cache(b"hash", entry)
+                    is False
+                )
+            assert manager.get_stats().hot_cache_promotion_failures == 1
+        finally:
+            manager.close()
+
+        disabled = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache_disabled",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=0,
+        )
+        try:
+            entry = {"tensors_raw": {}, "block_metadata": None}
+            assert disabled._promote_pending_write_to_hot_cache(b"hash", entry) is False
+            assert disabled.get_stats().hot_cache_promotion_failures == 0
+        finally:
+            disabled.close()
+
+    def test_preload_excludes_failed_promotions(self, tmp_path, mx):
+        """Blocks whose promotion fails are not counted as preloaded."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(manager, mx, count=4)
+
+        try:
+            with patch.object(
+                manager2, "_promote_to_hot_cache", return_value=False
+            ) as promote:
+                loaded = manager2.preload_matched_blocks(hashes)
+            assert promote.call_count == 4
+            assert loaded == 0
+            assert manager2.get_stats_dict()["preload_blocks_loaded"] == 0
+        finally:
+            manager2.close()
 
     def test_clean_promoted_block_eviction_skips_ssd_write(self, tmp_path, mx):
         """Blocks loaded from SSD are clean and should not be re-written."""

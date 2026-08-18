@@ -35,6 +35,10 @@ final class ModelSettingsScreenVM {
         case reasoningParser
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvBits
+        case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
+        case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
+        case qwen35AnePrefillDualAne, qwen35AnePrefillGdn
+        case qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnMaxLayers
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
         case dflashEnabled, dflashDraftModel, dflashMaxCtx
@@ -186,6 +190,25 @@ final class ModelSettingsScreenVM {
         ]
     }
 
+    static let qwen35AneSequenceLengthOptions: [(String, String)] = [
+        ("1024", "1,024 tokens"),
+        ("2048", "2,048 tokens — measured"),
+        ("4096", "4,096 tokens"),
+        ("8192", "8,192 tokens"),
+    ]
+
+    static let qwen35AneFractionOptions: [(String, String)] = [
+        ("0.15", "15%"),
+        ("0.25", "25%"),
+        ("0.35", "35%"),
+        ("0.4", "40%"),
+        ("0.45", "45%"),
+        ("0.5", "50%"),
+        ("0.53", "53%"),
+        ("0.55", "55%"),
+        ("0.6", "60%"),
+    ]
+
     /// `config_model_type` values that surface IndexCache in the HTML
     /// admin. Mirrored from `dashboard.js:5-7` (`DSA_MODEL_TYPES`).
     static let dsaConfigModelTypes: Set<String> = [
@@ -253,6 +276,22 @@ final class ModelSettingsScreenVM {
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool = false
     var turboquantKvBits: String = "4"
+
+    // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
+    // These defaults are the measured M3 Ultra optimum for the 2,048-token
+    // benchmark path. The feature itself remains opt-in.
+    var qwen35AnePrefillEnabled: Bool = false
+    var qwen35AnePrefillSequenceLength: String = "2048"
+    var qwen35AnePrefillFraction: String = "0.53"
+    var qwen35AnePrefillMaxLayers: String = "64"
+    var qwen35AnePrefillDualAne: Bool = true
+    var qwen35AnePrefillGdn: Bool = true
+    var qwen35AnePrefillGdnFraction: String = "0.5"
+    var qwen35AnePrefillGdnMaxLayers: String = "48"
+    var aneTuningID: String?
+    var aneTuningIsRunning: Bool = false
+    var aneTuningStatus: ANETuningStatusResponse?
+    var aneTuningIsApplying: Bool = false
 
     // Experimental: IndexCache (DSA-only)
     var indexCacheEnabled: Bool = false
@@ -341,6 +380,14 @@ final class ModelSettingsScreenVM {
             return true
         case .turboquantKvEnabled, .turboquantKvBits:
             return true
+        case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength:
+            return true
+        case .qwen35AnePrefillFraction, .qwen35AnePrefillMaxLayers:
+            return true
+        case .qwen35AnePrefillDualAne, .qwen35AnePrefillGdn:
+            return true
+        case .qwen35AnePrefillGdnFraction, .qwen35AnePrefillGdnMaxLayers:
+            return true
         case .indexCacheEnabled, .indexCacheFreq:
             return true
         case .specprefillEnabled, .specprefillDraftModel:
@@ -418,6 +465,11 @@ final class ModelSettingsScreenVM {
     func markProfileDirty() { self.profileDirty = true }
 
     func load(modelID: String, client: OMLXClient) async {
+        if self.modelID != modelID {
+            aneTuningID = nil
+            aneTuningIsRunning = false
+            aneTuningStatus = nil
+        }
         self.modelID = modelID
         do {
             let models = try await client.listModels().models
@@ -462,6 +514,14 @@ final class ModelSettingsScreenVM {
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
+                self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
+                self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
+                self.qwen35AnePrefillFraction = s?.qwen35AnePrefillFraction.map { Self.formatPct($0) } ?? "0.53"
+                self.qwen35AnePrefillMaxLayers = s?.qwen35AnePrefillMaxLayers.map(String.init) ?? "64"
+                self.qwen35AnePrefillDualAne = s?.qwen35AnePrefillDualAne ?? true
+                self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
+                self.qwen35AnePrefillGdnFraction = s?.qwen35AnePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
+                self.qwen35AnePrefillGdnMaxLayers = s?.qwen35AnePrefillGdnMaxLayers.map(String.init) ?? "48"
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -594,6 +654,19 @@ final class ModelSettingsScreenVM {
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
+        case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
+        case .qwen35AnePrefillSequenceLength:
+            patch.qwen35AnePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
+        case .qwen35AnePrefillFraction:
+            patch.qwen35AnePrefillFraction = Double(qwen35AnePrefillFraction)
+        case .qwen35AnePrefillMaxLayers:
+            patch.qwen35AnePrefillMaxLayers = Int(qwen35AnePrefillMaxLayers)
+        case .qwen35AnePrefillDualAne: patch.qwen35AnePrefillDualAne = qwen35AnePrefillDualAne
+        case .qwen35AnePrefillGdn:     patch.qwen35AnePrefillGdn = qwen35AnePrefillGdn
+        case .qwen35AnePrefillGdnFraction:
+            patch.qwen35AnePrefillGdnFraction = Double(qwen35AnePrefillGdnFraction)
+        case .qwen35AnePrefillGdnMaxLayers:
+            patch.qwen35AnePrefillGdnMaxLayers = Int(qwen35AnePrefillGdnMaxLayers)
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:
@@ -647,6 +720,90 @@ final class ModelSettingsScreenVM {
             self.lastError = nil
         } catch {
             self.lastError = error.omlxDescription
+        }
+    }
+
+    func startANETuning(client: OMLXClient) async {
+        guard !aneTuningIsRunning else { return }
+        guard let sequenceLength = Int(qwen35AnePrefillSequenceLength) else {
+            lastError = "ANE prompt block must be a number."
+            return
+        }
+        aneTuningIsRunning = true
+        aneTuningStatus = nil
+        lastError = nil
+        do {
+            let started = try await client.startANETuning(
+                ANETuningStartRequest(
+                    modelId: modelID,
+                    sequenceLength: sequenceLength,
+                    repeats: 2
+                )
+            )
+            aneTuningID = started.tuningId
+            while aneTuningIsRunning {
+                let snapshot = try await client.getANETuningResults(
+                    tuningId: started.tuningId
+                )
+                aneTuningStatus = snapshot
+                if snapshot.status != "running" {
+                    aneTuningIsRunning = false
+                    if snapshot.status == "error" {
+                        lastError = snapshot.error ?? "ANE tuning failed."
+                    }
+                    break
+                }
+                try await Task.sleep(for: .seconds(1))
+            }
+        } catch is CancellationError {
+            aneTuningIsRunning = false
+        } catch {
+            aneTuningIsRunning = false
+            lastError = error.omlxDescription
+        }
+    }
+
+    func cancelANETuning(client: OMLXClient) async {
+        guard let tuningID = aneTuningID, aneTuningIsRunning else { return }
+        do {
+            _ = try await client.cancelANETuning(tuningId: tuningID)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    func applyANETuningRecommendation(client: OMLXClient) async {
+        guard let recommendation = aneTuningStatus?.recommendation else { return }
+        aneTuningIsApplying = true
+        defer { aneTuningIsApplying = false }
+
+        var patch = ModelSettingsPatch()
+        patch.qwen35AnePrefillEnabled = recommendation.enabled
+        patch.qwen35AnePrefillSequenceLength = recommendation.sequenceLength
+        if recommendation.enabled {
+            patch.qwen35AnePrefillFraction = recommendation.mlpFraction
+            patch.qwen35AnePrefillDualAne = true
+            patch.qwen35AnePrefillGdn = recommendation.gdnEnabled
+            if recommendation.gdnEnabled {
+                patch.qwen35AnePrefillGdnFraction = recommendation.gdnFraction
+            }
+        }
+
+        do {
+            _ = try await client.updateModelSettings(id: modelID, patch: patch)
+            qwen35AnePrefillEnabled = recommendation.enabled
+            qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
+            if let fraction = recommendation.mlpFraction {
+                qwen35AnePrefillFraction = Self.formatPct(fraction)
+            }
+            qwen35AnePrefillDualAne = true
+            qwen35AnePrefillGdn = recommendation.gdnEnabled
+            if let fraction = recommendation.gdnFraction {
+                qwen35AnePrefillGdnFraction = Self.formatPct(fraction)
+            }
+            lastError = nil
+        } catch {
+            lastError = error.omlxDescription
         }
     }
 
@@ -737,6 +894,14 @@ final class ModelSettingsScreenVM {
     var isDSAConfigModel: Bool {
         guard let type = model?.configModelType else { return false }
         return Self.dsaConfigModelTypes.contains(type)
+    }
+
+    var isQwen35AnePrefillModel: Bool {
+        guard let rawType = model?.configModelType else { return false }
+        let type = rawType.lowercased().replacingOccurrences(of: "-", with: "_")
+        return type.hasPrefix("qwen3_5")
+            || type.hasPrefix("qwen3_6")
+            || type.hasPrefix("qwen3_8")
     }
 
     /// MTP can't co-exist with DFlash or TurboQuant KV. The toggle uses
@@ -885,6 +1050,18 @@ final class ModelSettingsScreenVM {
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+            }
+            putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
+            if qwen35AnePrefillEnabled {
+                putInt(ProfileSettingsKey.qwen35AnePrefillSequenceLength, qwen35AnePrefillSequenceLength)
+                putDouble(ProfileSettingsKey.qwen35AnePrefillFraction, qwen35AnePrefillFraction)
+                putInt(ProfileSettingsKey.qwen35AnePrefillMaxLayers, qwen35AnePrefillMaxLayers)
+                putBool(ProfileSettingsKey.qwen35AnePrefillDualAne, qwen35AnePrefillDualAne)
+                putBool(ProfileSettingsKey.qwen35AnePrefillGdn, qwen35AnePrefillGdn)
+                if qwen35AnePrefillGdn {
+                    putDouble(ProfileSettingsKey.qwen35AnePrefillGdnFraction, qwen35AnePrefillGdnFraction)
+                    putInt(ProfileSettingsKey.qwen35AnePrefillGdnMaxLayers, qwen35AnePrefillGdnMaxLayers)
+                }
             }
             if indexCacheEnabled, let n = Int(indexCacheFreq), n >= 2 {
                 out[ProfileSettingsKey.indexCacheFreq] = AnyCodable(n)
@@ -1237,10 +1414,14 @@ final class ModelSettingsScreenVM {
     /// "0.2"; `String(0.2)` happens to print as `"0.2"` on Darwin but
     /// `"0.20"` would not match. Format defensively so the dropdown shows
     /// the saved value highlighted.
-    fileprivate static func formatPct(_ v: Double) -> String {
+    static func formatPct(_ v: Double) -> String {
         // Always 1-2 decimals to match the option values.
         let rounded = (v * 100).rounded() / 100
-        if rounded == rounded.rounded() { return String(format: "%.1f", rounded) }
-        return String(format: "%.2f", rounded)
+        // Picker selections are matched by exact string identity.  In
+        // particular, the 50% option is declared as "0.5", so returning
+        // "0.50" after a server reload leaves the Picker with no selected
+        // tag and makes the persisted value appear blank.
+        let formatted = String(format: "%.2f", rounded)
+        return formatted.hasSuffix("0") ? String(formatted.dropLast()) : formatted
     }
 }
