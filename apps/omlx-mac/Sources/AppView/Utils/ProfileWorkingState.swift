@@ -77,6 +77,9 @@ struct ModelSettingsSnapshot: Equatable {
     var qwen35AnePrefillGdn: Bool
     var qwen35AnePrefillGdnFraction: String
     var qwen35AnePrefillGdnMaxLayers: String
+    var qwen35AnePrefillCpuEnabled: Bool
+    var qwen35AnePrefillCpuFraction: String
+    var qwen35AnePrefillCpuThreads: String
     var indexCacheEnabled: Bool
     var indexCacheFreq: String
     var specprefillEnabled: Bool
@@ -90,6 +93,7 @@ struct ModelSettingsSnapshot: Equatable {
     var dflashDraftQuantActivationBits: String
     var dflashDraftQuantGroupSize: String
     var dflashMaxCtx: String
+    var dflashBlockSize: String
     var dflashVerifyMode: String
     var dflashDraftWindowSize: String
     var dflashDraftSinkSize: String
@@ -145,6 +149,12 @@ enum ProfileSettingsKey {
     static let qwen35AnePrefillGdn = "qwen35_ane_prefill_gdn"
     static let qwen35AnePrefillGdnFraction = "qwen35_ane_prefill_gdn_fraction"
     static let qwen35AnePrefillGdnMaxLayers = "qwen35_ane_prefill_gdn_max_layers"
+    static let qwen35AnePrefillCpuEnabled = "qwen35_ane_prefill_cpu_enabled"
+    static let qwen35AnePrefillCpuFraction = "qwen35_ane_prefill_cpu_fraction"
+    static let qwen35AnePrefillCpuDownFraction = "qwen35_ane_prefill_cpu_down_fraction"
+    static let qwen35AnePrefillCpuGdnFraction = "qwen35_ane_prefill_cpu_gdn_fraction"
+    static let qwen35AnePrefillCpuThreads = "qwen35_ane_prefill_cpu_threads"
+    static let qwen35AnePrefillCpuSharedResource = "qwen35_ane_prefill_cpu_shared_resource"
     static let indexCacheFreq = "index_cache_freq"
     static let specprefillEnabled = "specprefill_enabled"
     static let specprefillDraftModel = "specprefill_draft_model"
@@ -160,6 +170,7 @@ enum ProfileSettingsKey {
     static let dflashVerifyMode = "dflash_verify_mode"
     static let dflashDraftWindowSize = "dflash_draft_window_size"
     static let dflashDraftSinkSize = "dflash_draft_sink_size"
+    static let dflashBlockSize = "dflash_block_size"
     static let dflashInMemoryCache = "dflash_in_memory_cache"
     static let dflashInMemoryCacheMaxBytes = "dflash_in_memory_cache_max_bytes"
     static let dflashInMemoryCacheMaxEntries = "dflash_in_memory_cache_max_entries"

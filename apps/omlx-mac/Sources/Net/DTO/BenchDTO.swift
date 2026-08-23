@@ -57,6 +57,7 @@ struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
     let warmupMode: BenchmarkWarmupMode
+    let alignPromptToAne: Bool
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
@@ -226,6 +227,12 @@ struct ANETuningStartRequest: Encodable, Sendable {
     let modelId: String
     let sequenceLength: Int
     let repeats: Int
+    let allowCpu: Bool
+    let allowCpuGate: Bool
+    let allowCpuDown: Bool
+    let allowAneGdn: Bool
+    let allowCpuGdn: Bool
+    let allowCpuSharedResource: Bool
 }
 
 struct ANETuningStartResponse: Codable, Sendable {
@@ -236,13 +243,22 @@ struct ANETuningStartResponse: Codable, Sendable {
 
 struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
     let label: String
+    let detail: String?
+    let stage: String?
     let enabled: Bool
     let mlpFraction: Double?
     let gdnEnabled: Bool
     let gdnFraction: Double?
-    let processingTps: Double
+    let cpuEnabled: Bool?
+    let cpuFraction: Double?
+    let cpuDownFraction: Double?
+    let cpuGdnFraction: Double?
+    let state: String?
+    let processingTps: Double?
+    let latencyMs: Double?
     let samples: [Double]
     let speedupPercent: Double?
+    let error: String?
 
     var id: String { label }
 }
@@ -252,6 +268,12 @@ struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
     let mlpFraction: Double?
     let gdnEnabled: Bool
     let gdnFraction: Double?
+    let cpuEnabled: Bool?
+    let cpuFraction: Double?
+    let cpuDownFraction: Double?
+    let cpuGdnFraction: Double?
+    let cpuThreads: Int?
+    let cpuSharedResource: Bool?
     let processingTps: Double
     let speedupPercent: Double
     let sequenceLength: Int
@@ -268,6 +290,7 @@ struct ANETuningStatusResponse: Codable, Sendable {
     let results: [ANETuningCandidateDTO]
     let recommendation: ANETuningRecommendationDTO?
     let error: String?
+    let terminationReason: String?
 }
 
 struct ANETuningCancelResponse: Codable, Sendable {

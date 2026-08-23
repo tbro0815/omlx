@@ -3340,6 +3340,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if getattr(request, "benchmark_trace", False):
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
@@ -3449,6 +3452,9 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
+            if getattr(request, "benchmark_trace", False):
+                request.benchmark_prefill_chunks.append(int(n_to_process))
+                request.benchmark_requested_steps.append(int(prefill_step_size))
 
             _throttle_pre = get_phys_footprint()
             # External prefill bypasses BatchGenerator, so it must establish
@@ -3624,18 +3630,28 @@ class Scheduler:
                 _ane_sequence = int(
                     getattr(request, "benchmark_ane_sequence_length", 0) or 0
                 )
+                _ane_full_tiles, _ane_tail_tokens = (0, n_to_process)
+                if _ane_sequence > 0:
+                    _ane_full_tiles, _ane_tail_tokens = divmod(
+                        n_to_process, _ane_sequence
+                    )
                 logger.info(
                     "[benchmark-prefill] rid=%s path=external chunk_tokens=%d "
                     "processed=%d->%d kv_before=%d requested_step=%d "
-                    "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
-                    "overhead_ms=%.3f",
+                    "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                    "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                    "total_ms=%.3f overhead_ms=%.3f",
                     request.request_id,
                     n_to_process,
                     _trace_processed_before,
                     processed_tokens,
                     base_size + _trace_processed_before,
                     prefill_step_size,
-                    bool(_ane_sequence and n_to_process == _ane_sequence),
+                    boundary_enabled,
+                    block_size if boundary_enabled else 0,
+                    _ane_sequence,
+                    _ane_full_tiles,
+                    _ane_tail_tokens,
                     _trace_model_ms,
                     _trace_total_ms,
                     max(0.0, _trace_total_ms - _trace_model_ms),
@@ -4891,6 +4907,9 @@ class Scheduler:
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
+        if getattr(request, "benchmark_trace", False):
+            request.benchmark_boundary_enabled = boundary_enabled
+            request.benchmark_cache_block_size = block_size if boundary_enabled else 0
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         if (
             boundary_enabled
@@ -4982,6 +5001,9 @@ class Scheduler:
             loop_label="chunked_step",
             request_id=state.request.request_id,
         )
+        if getattr(state.request, "benchmark_trace", False):
+            state.request.benchmark_prefill_chunks.append(int(n))
+            state.request.benchmark_requested_steps.append(int(prefill_step_size))
 
         _throttle_pre = get_phys_footprint()
         # Chunked prefill also bypasses BatchGenerator and must establish the
@@ -5109,18 +5131,26 @@ class Scheduler:
             _ane_sequence = int(
                 getattr(state.request, "benchmark_ane_sequence_length", 0) or 0
             )
+            _ane_full_tiles, _ane_tail_tokens = (0, n)
+            if _ane_sequence > 0:
+                _ane_full_tiles, _ane_tail_tokens = divmod(n, _ane_sequence)
             logger.info(
                 "[benchmark-prefill] rid=%s path=chunked_step chunk_tokens=%d "
                 "processed=%d->%d kv_before=%d requested_step=%d "
-                "ane_shape=%s model_cache_ms=%.3f total_ms=%.3f "
-                "overhead_ms=%.3f",
+                "boundary_enabled=%s cache_block_size=%d ane_tile=%d "
+                "ane_full_tiles=%d ane_tail_tokens=%d model_cache_ms=%.3f "
+                "total_ms=%.3f overhead_ms=%.3f",
                 state.request.request_id,
                 n,
                 _trace_processed_before,
                 state.tokens_processed,
                 state.base_size + _trace_processed_before,
                 prefill_step_size,
-                bool(_ane_sequence and n == _ane_sequence),
+                state.boundary_enabled,
+                state.block_size if state.boundary_enabled else 0,
+                _ane_sequence,
+                _ane_full_tiles,
+                _ane_tail_tokens,
                 _trace_model_ms,
                 chunk_dt * 1000.0,
                 max(0.0, chunk_dt * 1000.0 - _trace_model_ms),
@@ -10450,6 +10480,22 @@ class Scheduler:
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
+                benchmark_prefill_chunks=(
+                    list(getattr(request, "benchmark_prefill_chunks", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
+                ),
+                benchmark_requested_steps=(
+                    list(getattr(request, "benchmark_requested_steps", []))
+                    if getattr(request, "benchmark_trace", False)
+                    else []
+                ),
+                benchmark_boundary_enabled=bool(
+                    getattr(request, "benchmark_boundary_enabled", False)
+                ),
+                benchmark_cache_block_size=int(
+                    getattr(request, "benchmark_cache_block_size", 0) or 0
+                ),
             )
 
             if not is_finished:
@@ -12143,6 +12189,8 @@ class Scheduler:
                 return isinstance(v, int) and not isinstance(v, bool) and v > 0
 
             if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+                from .memory_monitor import _ane_prefill_transient_bytes
+
                 self.memory_monitor.set_model_info(
                     num_layers=num_layers,
                     num_kv_heads=num_kv_heads,
@@ -12156,6 +12204,11 @@ class Scheduler:
                     kv_bytes_per_token=kv_bytes_per_token,
                     rotating_layer_specs=rotating_layer_specs,
                     prefill_memory_profile=prefill_memory_profile,
+                    # ANE prefill holds fixed-shape I/O surfaces the first
+                    # long prompt dirties on top of KV+SDPA (issue #2841).
+                    ane_prefill_transient_bytes=_ane_prefill_transient_bytes(
+                        self.model
+                    ),
                 )
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
@@ -12374,13 +12427,27 @@ class Scheduler:
             # happy path here is ``has_model_info() is True``; this
             # else branch only fires for skeletal test fixtures.
             if self.memory_monitor is not None and self.memory_monitor.has_model_info():
-                # ``estimate_block_memory(1)`` returns all-layers K+V
-                # bytes for a single token at the dtype the monitor was
-                # configured with — exactly the per-token cost the
-                # queue cap needs to weigh.
-                expected_kv_bytes_per_token = self.memory_monitor.estimate_block_memory(
-                    1
+                # ``estimate_block_memory(1)`` returns the per-token K+V
+                # bytes for the layers that actually retain KV state at the
+                # dtype the monitor was configured with. Recurrent layers
+                # keep fixed state and must not inflate the block estimate.
+                # A rotating-only or ArraysCache-only layout therefore has a
+                # legitimate zero estimate; it is not a safe queue-sizing
+                # value because the cap formula would treat every block as a
+                # one-byte payload and select the 256-entry ceiling.
+                estimated_kv_bytes_per_token = (
+                    self.memory_monitor.estimate_block_memory(1)
                 )
+                expected_kv_bytes_per_token = (
+                    estimated_kv_bytes_per_token
+                    if estimated_kv_bytes_per_token > 0
+                    else 200_000  # PagedSSDCacheManager default
+                )
+                if estimated_kv_bytes_per_token <= 0:
+                    logger.debug(
+                        "No per-token KV layers detected; using the "
+                        "PagedSSDCacheManager default for pending-write sizing"
+                    )
             else:
                 expected_kv_bytes_per_token = 200_000  # PagedSSDCacheManager default
 
