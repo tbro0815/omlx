@@ -7728,26 +7728,73 @@ async def external_model_catalog(
         }
 
     if provider in ("claude_cli", "codex_cli"):
-        # Subscription relay: report CLI availability + a static model
-        # list (the CLIs accept model aliases, not a queryable catalog).
+        # Subscription relay: report CLI availability + an alias catalog.
+        #
+        # The CLIs take model *aliases* and expose no machine-readable
+        # catalog, so the list is baked in and inevitably drifts as vendors
+        # rename models. Picking a concrete alias is not cosmetic: "default"
+        # follows whatever the account rolls forward to, which is how an
+        # older CLI ends up asking for a model it cannot serve (400
+        # "requires a newer version of Codex"). It also makes capability
+        # comparisons impossible, since the models self-report only a
+        # coarse family name.
+        #
+        # ~/.omlx/cli-models.json overrides the baked list without a code
+        # change; "default" is always offered, so only list real aliases:
+        #
+        #   {"codex_cli": ["gpt-5.7-sol",
+        #                  {"id": "gpt-5.7-luna", "name": "5.7 Luna"}]}
         from ..engine.cli_relay import cli_available
 
         ok, detail = cli_available(provider)
         if not ok:
             raise HTTPException(status_code=502, detail=detail)
-        if provider == "claude_cli":
-            models = [
-                {"id": "default", "name": "Subscription default model"},
+
+        # Verified against codex-cli 0.143.x and Claude Code, Aug 2026.
+        cli_catalogs: dict[str, list[dict[str, Any]]] = {
+            "claude_cli": [
                 {"id": "opus", "name": "Claude Opus (current)"},
                 {"id": "sonnet", "name": "Claude Sonnet (current)"},
                 {"id": "haiku", "name": "Claude Haiku (current)"},
-            ]
-        else:
-            models = [
-                {"id": "default", "name": "Subscription default model"},
-                {"id": "gpt-5.2-codex", "name": "GPT-5.2 Codex"},
-                {"id": "gpt-5.2", "name": "GPT-5.2"},
-            ]
+            ],
+            "codex_cli": [
+                {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol — frontier agentic coding"},
+                {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra — balanced, everyday"},
+                {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna — fast and affordable"},
+                {"id": "gpt-5.5", "name": "GPT-5.5 — complex coding and research"},
+                {"id": "gpt-5.4", "name": "GPT-5.4 — strong everyday coding"},
+                {"id": "gpt-5.4-mini", "name": "GPT-5.4 mini — small, fast, cheap"},
+                {"id": "gpt-5.3-codex-spark", "name": "GPT-5.3 Codex Spark"},
+            ],
+        }
+        aliases = cli_catalogs[provider]
+
+        override_path = Path.home() / ".omlx" / "cli-models.json"
+        try:
+            if override_path.is_file():
+                custom = json.loads(override_path.read_text()).get(provider)
+                cleaned: list[dict[str, Any]] = []
+                for item in custom if isinstance(custom, list) else []:
+                    if isinstance(item, str) and item.strip():
+                        cleaned.append({"id": item.strip(), "name": item.strip()})
+                    elif isinstance(item, dict) and str(item.get("id", "")).strip():
+                        mid = str(item["id"]).strip()
+                        cleaned.append(
+                            {"id": mid, "name": str(item.get("name") or mid)}
+                        )
+                if cleaned:
+                    aliases = cleaned
+                    logger.info(
+                        f"Using {len(cleaned)} {provider} aliases from "
+                        f"{override_path}"
+                    )
+        except (OSError, ValueError) as exc:
+            logger.warning(f"Ignoring malformed {override_path}: {exc}")
+
+        models = [
+            {"id": "default", "name": "Subscription default model"},
+            *(dict(a) for a in aliases),
+        ]
         for m in models:
             m.setdefault("context_length", None)
             m.setdefault("modality", "text")
