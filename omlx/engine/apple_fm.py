@@ -145,7 +145,7 @@ class AppleFMEngine(BaseEngine):
             raise RuntimeError(
                 "apple-fm-sdk is not installed in the oMLX environment. "
                 "Install with: "
-                "\"$(brew --prefix omlx)/libexec/bin/pip\" install apple-fm-sdk "
+                "\"$(brew --prefix omlx-omni)/libexec/bin/pip\" install apple-fm-sdk "
                 "(requires macOS 26+, Xcode 26+ with the SDK agreement "
                 "accepted, and Apple Intelligence enabled)."
             ) from e

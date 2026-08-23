@@ -895,6 +895,13 @@ class EnginePool:
         self, model_id: str, entry: EngineEntry
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
+        # External (remote API) entries are not backed by a local directory:
+        # their model_path is the synthetic "<base_url>#<remote_model>" handle
+        # (e.g. "cli://codex#default"). Without this exemption every attempt to
+        # use one deletes the injected entry and 404s, and it only reappears on
+        # the next _inject_external_entries().
+        if entry.source_type == "external":
+            return
         model_path = Path(entry.model_path)
         if model_path.exists() and (model_path / "config.json").exists():
             return

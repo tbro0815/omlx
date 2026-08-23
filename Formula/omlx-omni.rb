@@ -144,6 +144,12 @@ class OmlxOmni < Formula
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system(*pip_install, "python-multipart>=0.0.5")
 
+    # Apple Foundation Models bridge for the omni external-model manager.
+    # Hand-installing this into the venv does not survive an upgrade (the keg
+    # is rebuilt), so declare it here. Requires macOS 26+; skipped on older
+    # systems so the build still succeeds there.
+    system(*pip_install, "apple-fm-sdk") if MacOS.version >= "26"
+
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 

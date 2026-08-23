@@ -7615,7 +7615,7 @@ async def external_model_catalog(
                 status_code=502,
                 detail=(
                     "apple-fm-sdk is not installed in the oMLX environment. "
-                    "Install with: \"$(brew --prefix omlx)/libexec/bin/pip\" "
+                    "Install with: \"$(brew --prefix omlx-omni)/libexec/bin/pip\" "
                     "install apple-fm-sdk (requires macOS 26+, Xcode 26+, "
                     "Apple Intelligence enabled)."
                 ),
