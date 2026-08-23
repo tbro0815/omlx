@@ -8,12 +8,12 @@
 class OmlxOmni < Formula
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
-  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.6.2-omni.tar.gz"
-  version "0.6.2-omni"
-  sha256 "56f9a493e43d248477e39e9800ee59d819720e6df2a83c12cf019da68b6744e5"
+  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.6.3rc2-omni.tar.gz"
+  version "0.6.3rc2-omni"
+  sha256 "4d8fd3280e5854efc59f62bb6e596e65e0a030eaff42f44750695840f7ae88c2"
   license "Apache-2.0"
 
-  head "https://github.com/tbro0815/omlx.git", branch: "omni/v0.6"
+  head "https://github.com/tbro0815/omlx.git", branch: "omni/v0.6.3"
 
   option "with-custom-kernel",
          "Build native custom kernels for GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
