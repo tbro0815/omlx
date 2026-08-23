@@ -148,9 +148,41 @@ class OmlxOmni < Formula
     # Hand-installing this into the venv does not survive an upgrade (the keg
     # is rebuilt), so declare it here. Requires macOS 26+; skipped on older
     # systems so the build still succeeds there.
-    system(*pip_install, "apple-fm-sdk") if MacOS.version >= "26"
+    #
+    # Non-fatal on purpose: apple-fm-sdk builds a Swift package, and SwiftPM
+    # sandboxes its own manifest compilation. That nested sandbox_apply() is
+    # refused inside Homebrew's build sandbox ("sandbox-exec: sandbox_apply:
+    # Operation not permitted"), which would otherwise abort the whole
+    # install over one optional extra. Build with HOMEBREW_NO_SANDBOX=1 to
+    # get it during install, or add it afterwards -- see caveats.
+    if MacOS.version >= "26" && !quiet_system(*pip_install, "apple-fm-sdk")
+      opoo <<~MSG
+        apple-fm-sdk did not build; Apple Foundation Models will be unavailable.
+        This is expected inside Homebrew's sandbox. To add it:
+          "#{opt_libexec}/bin/pip" install apple-fm-sdk
+      MSG
+    end
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
+  end
+
+  def caveats
+    return unless MacOS.version >= "26"
+    # Glob rather than a fixed name: matches the package dir or its
+    # dist-info, whichever apple-fm-sdk lays down.
+    return if Dir[libexec/"lib/python3.11/site-packages/apple_fm*"].any?
+
+    <<~EOS
+      Apple Foundation Models support is not installed. SwiftPM cannot build
+      apple-fm-sdk inside Homebrew's sandbox, so add it afterwards:
+
+        "#{opt_libexec}/bin/pip" install apple-fm-sdk
+        brew services restart tbro0815/omlx-omni/omlx-omni
+
+      Or reinstall with the sandbox off to get it during the build:
+
+        HOMEBREW_NO_SANDBOX=1 brew reinstall tbro0815/omlx-omni/omlx-omni
+    EOS
   end
 
   # Both fixups below must run in post_install rather than install because
