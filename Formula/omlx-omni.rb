@@ -8,9 +8,9 @@
 class OmlxOmni < Formula
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
-  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.6.3rc2-omni.tar.gz"
-  version "0.6.3rc2-omni"
-  sha256 "4d8fd3280e5854efc59f62bb6e596e65e0a030eaff42f44750695840f7ae88c2"
+  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.6.3rc3-omni.tar.gz"
+  version "0.6.3rc3-omni"
+  sha256 "c09e1a7e4d4c72b87be15b11eb41f49a22ec83c806f102aed870f266597a0a43"
   license "Apache-2.0"
 
   head "https://github.com/tbro0815/omlx.git", branch: "omni/v0.6.3"
