@@ -20,6 +20,8 @@ _VLM_TEXT_PREFIX = "language_model."
 _CKPT_TEXT_PREFIX = "model.language_model."
 _RUNTIME_TEXT_PREFIX = "language_model.model."
 
+_MATERIALIZE_EVAL_CHUNK = 8
+
 _MLX_LM_LOAD_CONFIG_PATCHED = False
 
 _REMOTE_CODE_METADATA_PATTERNS = [
@@ -241,6 +243,29 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_hy_v3_rope_config(cfg: dict) -> dict:
+    """Adapt legacy Hy-MT2 RoPE settings to mlx-lm's ``hy_v3`` schema.
+
+    Tencent's Hy-MT2 checkpoints publish the RoPE base as a root-level
+    ``rope_theta`` value, while the Hy3 model implementation consumes a
+    structured ``rope_parameters`` mapping. Fill that mapping only when it is
+    absent (or explicitly null) so newer checkpoints with an authoritative
+    structured configuration pass through unchanged.
+
+    Mutates *cfg* in place and returns it for convenience.
+    """
+    if (
+        cfg.get("model_type") == "hy_v3"
+        and cfg.get("rope_parameters") is None
+        and cfg.get("rope_theta") is not None
+    ):
+        cfg["rope_parameters"] = {
+            "rope_theta": cfg["rope_theta"],
+            "rope_type": "default",
+        }
+    return cfg
+
+
 def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
 
@@ -339,6 +364,7 @@ def _patch_mlx_lm_load_config() -> None:
 
     def _patched(model_path, *args, **kwargs):
         cfg = _original(model_path, *args, **kwargs)
+        normalize_hy_v3_rope_config(cfg)
         expand_per_layer_quant_keys(cfg)
         expand_glm_moe_dsa_fused_quant_keys(cfg)
         normalize_laguna_compressed_quant(cfg)
@@ -592,6 +618,75 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type == "qwen4_exp":
+        from ..patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+            configure_qwen4_exp_runtime,
+        )
+
+        if apply_mlx_vlm_qwen4_exp_compat_patch():
+            logger.info(
+                "Qwen4-Exp mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+        mtp_requested = bool(
+            model_settings is not None and getattr(model_settings, "mtp_enabled", False)
+        )
+        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        mtp_active = mtp_requested and has_mtp_weights
+        if mtp_requested and not has_mtp_weights:
+            logger.warning(
+                "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+                "MTP tensors were found",
+                model_name,
+            )
+
+        from ..patches.mlx_lm_mtp import (
+            apply_mlx_lm_mtp_patch,
+            set_mtp_active,
+            set_mtp_depth,
+        )
+
+        set_mtp_active(mtp_active)
+        depth = (
+            getattr(model_settings, "mtp_num_draft_tokens", None)
+            if model_settings is not None
+            else None
+        )
+        # Qwen4-Exp uses the same adaptive draft-depth controller as the
+        # general Lightning MTP path.  A single MTP hidden layer can be
+        # chained autoregressively, so default to the validated max depth 3.
+        set_mtp_depth(int(depth) if depth else 3)
+        if mtp_active and not apply_mlx_lm_mtp_patch():
+            logger.warning(
+                "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
+                "speculative decoding will remain inactive",
+                model_name,
+            )
+            set_mtp_active(False)
+            mtp_active = False
+        configure_qwen4_exp_runtime(
+            model_name,
+            mode=(
+                "mmap"
+                if model_settings is not None
+                and getattr(model_settings, "qwen4_ple_ssd_offload", False)
+                else "resident" if model_settings is not None else None
+            ),
+            mtp_enabled=mtp_active,
+        )
+
+    if for_vlm and model_type == "glm5_next":
+        from ..patches.mlx_vlm_glm5_next_compat import (
+            apply_mlx_vlm_glm5_next_compat_patch,
+        )
+
+        if apply_mlx_vlm_glm5_next_compat_patch():
+            logger.info(
+                "GLM-5.3 mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
@@ -747,7 +842,11 @@ def maybe_apply_pre_load_patches(
                             "load only)",
                             model_name,
                         )
-    elif model_settings is not None and getattr(model_settings, "mtp_enabled", False):
+    elif (
+        model_type != "qwen4_exp"
+        and model_settings is not None
+        and getattr(model_settings, "mtp_enabled", False)
+    ):
         logger.warning(
             "mtp_enabled=True for %s but model is incompatible "
             "(model_type=%r, mtp_heads=%s); MTP path will be inactive",
@@ -1051,7 +1150,16 @@ def materialize_lazy_state(model: Any) -> None:
                 _scan_plain_object(value)
 
     if arrays:
-        mx.eval(arrays)
+        # Evaluate in bounded chunks rather than one mx.eval(arrays). A single
+        # eval over the whole parameter tree submits one Metal command buffer
+        # spanning every array; on a multi-hundred-GB checkpoint (e.g. the raw
+        # BF16 Qwen3.8-Flash-Next base, ~336 GB / 1676 arrays) that buffer
+        # exceeds the GPU command-buffer watchdog and aborts the process with
+        # "[METAL] Command buffer execution failed: Caused GPU Timeout Error
+        # (kIOGPUCommandBufferCallbackErrorTimeout)". Chunking bounds each
+        # command buffer; small models see only a handful of chunks. See #3179.
+        for start in range(0, len(arrays), _MATERIALIZE_EVAL_CHUNK):
+            mx.eval(arrays[start : start + _MATERIALIZE_EVAL_CHUNK])
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
