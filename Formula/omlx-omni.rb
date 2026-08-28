@@ -6,17 +6,31 @@
 # fails with `does not define resource "mlx-audio"`. Keep this file a full
 # copy and re-sync it from Formula/omlx.rb when upstream changes.
 class OmlxOmni < Formula
-  # Release coordinates, kept together so a version bump is a two-line edit
-  # (omni_version + sha256) instead of a hand-edited URL. `formula-bump.sh`
-  # rewrites exactly these two lines. A class-body local, not a constant:
-  # Homebrew may load a formula file more than once per run, and a constant
-  # would emit "already initialized constant" warnings.
-  omni_version = "0.6.3-omni"
+  # Release coordinates. `omni_tag` is what we download; `omni_version` is what
+  # Homebrew orders releases by, and it deliberately carries NO "-omni" suffix.
+  #
+  # Homebrew tokenizes "0.6.3rc3-omni" as [0, 6, 3, rc3, "omni"] and
+  # "0.6.3-omni" as [0, 6, 3, "omni"]. Comparison reaches position 3 and
+  # compares StringToken("omni") against RCToken("rc3"); RCToken subclasses
+  # StringToken, so the prerelease ranking never applies and it degrades to
+  # "omni" <=> "rc3", which is NEGATIVE. The final release then looks OLDER
+  # than its own release candidate and `brew upgrade` says "already
+  # installed" -- observed on 0.5.8.dev3 and again on 0.6.3.
+  #
+  # Plain "0.6.3" tokenizes to [0, 6, 3]. The absent 4th token is NullToken,
+  # which explicitly sorts ABOVE alpha/beta/pre/rc, so rc3 < final always.
+  # Fork identity lives in the keg name (omlx-omni) and in oMLX's own
+  # __display_version__ ("0.6.3-omni"), which is what the UI and CLI show.
+  #
+  # A class-body local, not a constant: Homebrew may load a formula file more
+  # than once per run, and a constant would warn about redefinition.
+  omni_tag = "v0.6.3-omni"
+  omni_version = "0.6.3"
   omni_branch = "omni/v0.6.3"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
-  url "https://github.com/tbro0815/omlx/archive/refs/tags/v#{omni_version}.tar.gz"
+  url "https://github.com/tbro0815/omlx/archive/refs/tags/#{omni_tag}.tar.gz"
   version omni_version
   sha256 "d0cc1d298988f4e2fd51af0cfcbea8670eb1994f153165b2d472ef9490dbf1f8"
   license "Apache-2.0"
