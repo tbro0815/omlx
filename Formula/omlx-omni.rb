@@ -106,8 +106,18 @@ class OmlxOmni < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Install omlx (with optional grammar extra for structured output)
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    # Install omlx with the extras this fork always wants.
+    #
+    # `jang` is NOT optional for us: upstream 0.6.3 moved JANG support behind
+    # an extra ("jang[mlx]"), and jang.py only does `import jang_tools` at load
+    # time. Without the extra every JANG/JANGTQ model fails to load -- which is
+    # most of this fork's reason to exist. Upstream's own formula omits it, so
+    # this must be re-applied whenever Formula/omlx.rb is re-synced.
+    #
+    # `grammar` stays opt-in because it drags in torch (~2GB).
+    extras = ["jang"]
+    extras << "grammar" if build.with?("grammar")
+    install_spec = "#{buildpath}[#{extras.join(",")}]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")

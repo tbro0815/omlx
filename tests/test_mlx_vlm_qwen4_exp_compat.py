@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from types import SimpleNamespace
 
@@ -388,6 +389,40 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
+def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+    import omlx.scheduler  # noqa: F401  (installs BatchGenerator cache patches)
+
+    qsa_cache = QSAKVCache()
+    qsa_cache.state = (
+        mx.arange(24, dtype=mx.float32).reshape(1, 2, 3, 4),
+        mx.arange(24, 48, dtype=mx.float32).reshape(1, 2, 3, 4),
+        mx.arange(12, dtype=mx.float32).reshape(1, 3, 4),
+        mx.array([[5, 6, 7]], dtype=mx.int32),
+    )
+
+    class Model:
+        layers = (object(),)
+
+        def make_cache(self):
+            return [qsa_cache]
+
+    generate = importlib.import_module("mlx_lm.generate")
+    caches = generate._make_cache(Model(), [0], None)
+
+    assert len(caches) == 1
+    assert isinstance(caches[0], BatchQSAKVCache)
+    mx.eval(caches[0].offset, caches[0].index_keys, caches[0].index_position_ids)
+    assert caches[0].offset.tolist() == [3]
+    assert caches[0].index_offset == 3
+    assert mx.array_equal(caches[0].index_keys, qsa_cache.index_keys).item()
+    assert mx.array_equal(
+        caches[0].index_position_ids, qsa_cache.index_position_ids
+    ).item()
+
+
 def test_qwen4_fp8_ple_dequantizes_only_selected_rows():
     _tiny_config()
     from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
@@ -476,6 +511,41 @@ def test_qwen4_verify_matches_singleton_greedy_and_rolls_back_qsa():
     assert qsa_cache.offset == 4
     assert qsa_cache.index_keys.shape[1] == 4
     assert qsa_cache.index_position_ids.shape[-1] == 4
+
+
+def test_qwen4_lightning_mtp_rejects_nextn_only_layout(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {
+                    "num_hidden_layers": 2,
+                    "num_nextn_predict_layers": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.2.self_attn.q_proj.weight": "model.safetensors"
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        assert runtime.enabled is False
+        assert runtime.checkpoint_prefix is None
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
 
 
 def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
