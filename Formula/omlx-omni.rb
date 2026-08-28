@@ -11,14 +11,14 @@ class OmlxOmni < Formula
   # rewrites exactly these two lines. A class-body local, not a constant:
   # Homebrew may load a formula file more than once per run, and a constant
   # would emit "already initialized constant" warnings.
-  omni_version = "0.6.3rc3-omni"
+  omni_version = "0.6.3-omni"
   omni_branch = "omni/v0.6.3"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
   url "https://github.com/tbro0815/omlx/archive/refs/tags/v#{omni_version}.tar.gz"
   version omni_version
-  sha256 "c09e1a7e4d4c72b87be15b11eb41f49a22ec83c806f102aed870f266597a0a43"
+  sha256 "d0cc1d298988f4e2fd51af0cfcbea8670eb1994f153165b2d472ef9490dbf1f8"
   license "Apache-2.0"
 
   head "https://github.com/tbro0815/omlx.git", branch: omni_branch
