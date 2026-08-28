@@ -6,14 +6,22 @@
 # fails with `does not define resource "mlx-audio"`. Keep this file a full
 # copy and re-sync it from Formula/omlx.rb when upstream changes.
 class OmlxOmni < Formula
+  # Release coordinates, kept together so a version bump is a two-line edit
+  # (omni_version + sha256) instead of a hand-edited URL. `formula-bump.sh`
+  # rewrites exactly these two lines. A class-body local, not a constant:
+  # Homebrew may load a formula file more than once per run, and a constant
+  # would emit "already initialized constant" warnings.
+  omni_version = "0.6.3rc3-omni"
+  omni_branch = "omni/v0.6.3"
+
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
-  url "https://github.com/tbro0815/omlx/archive/refs/tags/v0.6.3rc3-omni.tar.gz"
-  version "0.6.3rc3-omni"
+  url "https://github.com/tbro0815/omlx/archive/refs/tags/v#{omni_version}.tar.gz"
+  version omni_version
   sha256 "c09e1a7e4d4c72b87be15b11eb41f49a22ec83c806f102aed870f266597a0a43"
   license "Apache-2.0"
 
-  head "https://github.com/tbro0815/omlx.git", branch: "omni/v0.6.3"
+  head "https://github.com/tbro0815/omlx.git", branch: omni_branch
 
   option "with-custom-kernel",
          "Build native custom kernels for GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
