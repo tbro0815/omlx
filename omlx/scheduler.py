@@ -964,11 +964,57 @@ def _patched_make_cache(model, left_padding, max_kv_size):
         ):
             return type(cache_obj)(*(convert(child) for child in sub_caches))
 
+        _warn_if_auxiliary_state_dropped(cache_obj)
         return _original_make_cache(
             _SingleCacheModel(cache_obj), left_padding, max_kv_size
         )[0]
 
     return [convert(cache_obj) for cache_obj in model_cache]
+
+
+_AUXILIARY_STATE_ATTRS = ("index_keys", "index_position_ids")
+_auxiliary_drop_warned: set[str] = set()
+
+
+def _warn_if_auxiliary_state_dropped(cache_obj: Any) -> None:
+    """Say so when the generic fallback discards model-owned cache state.
+
+    A cache that carries auxiliary state beyond keys/values -- Qwen4-exp's
+    indexer keys and MRoPE positions are the live example -- and exposes no
+    ``to_batch`` gets rebuilt here as a plain batch cache, which has nowhere
+    to put that state. It is silently discarded: no error, no fallback, just
+    attention running without the indexer information it was given.
+
+    QSAQuantizedKVCache is the concrete case. It is produced only by
+    QSAKVCache.to_quantized (so it appears when KV quantization is on), and
+    it defines no merge/to_batch/extend and inherits none, so it lands here
+    with populated indexer arrays every time.
+
+    Warn once per class rather than fixing it: giving that class a real
+    batch conversion is untested work on a path this fork cannot currently
+    exercise, and a wrong conversion degrades output quality just as
+    quietly. A log line at least makes the degradation visible.
+    """
+    name = type(cache_obj).__name__
+    if name in _auxiliary_drop_warned:
+        return
+    if not any(
+        getattr(cache_obj, attr, None) is not None for attr in _AUXILIARY_STATE_ATTRS
+    ):
+        return
+    _auxiliary_drop_warned.add(name)
+    logger.warning(
+        "%s carries auxiliary cache state (%s) but provides no to_batch(); "
+        "the generic batch conversion will discard it. Attention quality may "
+        "degrade for this model. This is an upstream gap, not a "
+        "misconfiguration.",
+        name,
+        ", ".join(
+            attr
+            for attr in _AUXILIARY_STATE_ATTRS
+            if getattr(cache_obj, attr, None) is not None
+        ),
+    )
 
 
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
