@@ -992,6 +992,24 @@ def _to_batched_cache_layer(cache_obj: Any) -> Any:
         and type(cache_obj) is _TQ_SINGLETON_CACHE_TYPE
     ):
         return cache_obj.merge([cache_obj])
+    # Qwen4-exp's QSAKVCache is a model-owned singleton in neither table
+    # above: its batch counterpart BatchQSAKVCache defines extend(), the
+    # singleton only defines merge()/to_batch(). It therefore fell through
+    # unconverted and _extend_cache_layer raised "'QSAKVCache' object has no
+    # attribute 'extend'" when a request joined the batch. Upstream #3188
+    # taught _patched_make_cache to honor model-owned to_batch() but left
+    # this path alone.
+    #
+    # Matched by exact class name, NOT by a general "lacks extend()" rule.
+    # The general rule looks safer than it is: _patched_extend_cache also
+    # runs on the single-row prompt-priming handoff, so it reaches the
+    # hybrid/recurrent layer caches of this same model, and converting those
+    # corrupts the hyper-connection stream feeding the Lightning MTP head
+    # ("Qwen4 Lightning MTP expects hidden shape [batch, tokens,
+    # hc_count * hidden_size]"). Confirmed empirically: the broad rule broke
+    # single-request Flash-Next generation that worked before it.
+    if type(cache_obj).__name__ == "QSAKVCache":
+        return cache_obj.merge([cache_obj])
     return cache_obj
 
 
