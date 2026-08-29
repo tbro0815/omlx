@@ -169,14 +169,36 @@ class QSAKVCache(KVCache):
 
     @property
     def state(self):
+        # Slice the indexer arrays to `offset` alongside keys/values. They are
+        # grown by concatenation in update_indexer while keys/values live in a
+        # step-allocated buffer, so the two can disagree; returning keys cut to
+        # `offset` beside full-length indexer state hands consumers a pair that
+        # no longer describes the same tokens. BatchQSAKVCache.state and
+        # to_batch already slice, so this makes the singleton consistent with
+        # them.
         if self.keys is None:
-            return None, None, self.index_keys, self.index_position_ids
+            return (
+                None,
+                None,
+                self._index_keys_to_offset(),
+                self._index_positions_to_offset(),
+            )
         return (
             self.keys[..., : self.offset, :],
             self.values[..., : self.offset, :],
-            self.index_keys,
-            self.index_position_ids,
+            self._index_keys_to_offset(),
+            self._index_positions_to_offset(),
         )
+
+    def _index_keys_to_offset(self):
+        if self.index_keys is None:
+            return None
+        return self.index_keys[:, : self.offset]
+
+    def _index_positions_to_offset(self):
+        if self.index_position_ids is None:
+            return None
+        return self.index_position_ids[..., : self.offset]
 
     @state.setter
     def state(self, value):
@@ -192,20 +214,28 @@ class QSAKVCache(KVCache):
         return n
 
     def extract(self, idx):
+        # Cut to `offset` on the way out, as the parent KVCache.extract does.
+        # Without it the step-allocated zero tail rides along, and a cache
+        # whose keys are None but whose indexer arrays are populated would
+        # hand back offset=0 beside full-length index state.
         cache = QSAKVCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(self.keys[idx : idx + 1])
-            cache.values = mx.contiguous(self.values[idx : idx + 1])
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+            cache.values = mx.contiguous(
+                self.values[idx : idx + 1, :, : self.offset, :]
+            )
             cache.offset = self.offset
         if self.index_keys is not None:
-            cache.index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
+            cache.index_keys = mx.contiguous(
+                self.index_keys[idx : idx + 1, : self.offset]
+            )
             if self.index_position_ids.ndim == 3:
                 cache.index_position_ids = mx.contiguous(
-                    self.index_position_ids[:, idx : idx + 1]
+                    self.index_position_ids[:, idx : idx + 1, : self.offset]
                 )
             else:
                 cache.index_position_ids = mx.contiguous(
-                    self.index_position_ids[idx : idx + 1]
+                    self.index_position_ids[idx : idx + 1, : self.offset]
                 )
         return cache
 
