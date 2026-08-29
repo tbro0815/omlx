@@ -353,6 +353,23 @@ class BatchQSAKVCache:
             self.index_offset -= min_left
 
     @staticmethod
+    def _widest_positions(candidates):
+        """Pick the highest-rank positions array to normalize rows against.
+
+        Promotion only ever widens (2-D text -> 3-D MRoPE), so the sample has
+        to be the widest of the operands. Taking the first non-None one, as
+        the callers used to, could pick a 2-D sample and leave a 3-D row with
+        nothing to promote to.
+        """
+        widest = None
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if widest is None or candidate.ndim > widest.ndim:
+                widest = candidate
+        return widest
+
+    @staticmethod
     def _pad_index(cache, target, sample_keys, sample_positions):
         length = 0 if cache.index_keys is None else cache.index_offset
         left = target - length
@@ -373,6 +390,18 @@ class BatchQSAKVCache:
         else:
             keys = cache.index_keys[:, :length]
             positions = cache.index_position_ids[..., :length]
+            # Rows can disagree on rank: a text-only request carries 2-D
+            # [B, S] positions, one with image content carries 3-D MRoPE
+            # [3, B, S]. Callers pick a single `sample_positions` and then
+            # concatenate on an axis derived from it, so a row at the other
+            # rank either joins on the wrong axis or fails outright. Promote
+            # here, the same way _append_indexer_positions does at runtime --
+            # this is the one place every batch row passes through, so extend()
+            # and merge() are both covered.
+            if sample_positions is not None and positions.ndim < sample_positions.ndim:
+                positions = mx.broadcast_to(
+                    positions[None], (sample_positions.shape[0], *positions.shape)
+                )
         if left:
             keys = mx.pad(keys, [(0, 0), (left, 0), (0, 0)])
             positions = mx.pad(
@@ -392,10 +421,8 @@ class BatchQSAKVCache:
         sample_keys = (
             self.index_keys if self.index_keys is not None else other.index_keys
         )
-        sample_positions = (
-            self.index_position_ids
-            if self.index_position_ids is not None
-            else other.index_position_ids
+        sample_positions = self._widest_positions(
+            (self.index_position_ids, other.index_position_ids)
         )
         if sample_keys is None:
             return
@@ -440,6 +467,11 @@ class BatchQSAKVCache:
         sample = next((cache for cache in caches if cache.index_keys is not None), None)
         if sample is None:
             return out
+        # Rows may mix 2-D text and 3-D MRoPE positions; normalize against the
+        # widest rather than whichever happened to carry index_keys first.
+        sample_positions = cls._widest_positions(
+            [cache.index_position_ids for cache in caches]
+        )
         target = max(cache.offset for cache in caches)
         rows = [
             cls._pad_index(
@@ -451,12 +483,12 @@ class BatchQSAKVCache:
                 ),
                 target,
                 sample.index_keys,
-                sample.index_position_ids,
+                sample_positions,
             )
             for cache in caches
         ]
         out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
-        position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+        position_axis = 1 if sample_positions.ndim == 3 else 0
         out.index_position_ids = mx.concatenate(
             [row[1] for row in rows], axis=position_axis
         )
