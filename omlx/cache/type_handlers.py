@@ -1437,6 +1437,55 @@ def _serialize_qsa_positions(position_ids: Any) -> Any:
     )
 
 
+def _align_qsa_position_channels(elements: list[Any]) -> list[Any]:
+    """Broadcast ``[B, 1, S]`` text positions up to the widest channel count.
+
+    ``_serialize_qsa_positions`` fixes the *rank* at ``[B, C, S]`` but not
+    ``C``: a block stored while the request used plain text positions has
+    ``C == 1``, one stored under MRoPE has ``C == 3``. Concatenating a
+    sequence that spans both then fails on the non-sequence axis:
+
+        [concatenate] All the input array dimensions must match exactly
+        except for the concatenation axis. However, the provided shapes are
+        (1,1,2048), (1,3,2048), and the concatenation axis is 2.
+
+    which surfaced as "Failed to reconstruct cache" and a 100% re-prefill on
+    every turn of a long Qwen4-exp session.
+
+    Widening a text row to C replicates the single position across the MRoPE
+    channels, which is exactly what the model does at runtime when the two
+    layouts meet -- see ``_append_indexer_positions`` in the vendored
+    qwen4_exp language model, which broadcasts the 2-D side up before its own
+    concatenate. Narrowing instead would discard the h/w channels, so this
+    only ever widens.
+    """
+    if not HAS_MLX or len(elements) < 2:
+        return elements
+    channels = 0
+    for element in elements:
+        if element is None or getattr(element, "ndim", 0) != 3:
+            return elements
+        channels = max(channels, element.shape[1])
+    if channels <= 1 or all(e.shape[1] == channels for e in elements):
+        return elements
+    aligned = []
+    for element in elements:
+        if element.shape[1] == channels:
+            aligned.append(element)
+        elif element.shape[1] == 1:
+            aligned.append(
+                mx.broadcast_to(
+                    element, (element.shape[0], channels, element.shape[2])
+                )
+            )
+        else:
+            # Neither 1 nor the max: not a text/MRoPE pair, so there is no
+            # defined widening. Leave the list alone and let the concatenate
+            # raise rather than inventing channels.
+            return elements
+    return aligned
+
+
 def _deserialize_qsa_positions(position_ids: Any) -> Any:
     """Restore the model-facing text/MRoPE position layout."""
     if position_ids is None or not hasattr(position_ids, "ndim"):
@@ -1517,8 +1566,19 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
             if element is None:
                 sliced.append(None)
                 continue
+            # actual_end comes from `keys` alone (get_state_seq_len_from_tuple
+            # reads the first sliceable element). The indexer tensors can be
+            # shorter -- QSAKVCache.state returns them unsliced while keys are
+            # cut to `offset`, and trim() paths can leave them skewed -- and
+            # MLX clamps an out-of-range slice silently, yielding a short block
+            # that concatenates without error but no longer lines up with
+            # keys. Clamp per element instead, as the MiniMax M3 handler does.
+            element_end = min(actual_end, element.shape[info.sequence_axis])
+            if start_idx >= element_end:
+                sliced.append(None)
+                continue
             slices = [slice(None)] * element.ndim
-            slices[info.sequence_axis] = slice(start_idx, actual_end)
+            slices[info.sequence_axis] = slice(start_idx, element_end)
             sliced.append(element[tuple(slices)])
         return {
             **{
@@ -1532,21 +1592,33 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
     def concatenate_states(self, states: list[dict[str, Any]]) -> dict[str, Any]:
         if not HAS_MLX or not states:
             return {}
-        grouped: list[list[Any]] = [[] for _ in self.get_state_axis_info()]
+        axis_info = self.get_state_axis_info()
+        grouped: list[list[Any]] = [[] for _ in axis_info]
+        # A block missing an element must invalidate that element for the
+        # whole sequence. Collecting only the non-None ones silently yields a
+        # tensor shorter than `keys` that lines up with the wrong tokens --
+        # indexer state offset against the KV it describes is worse than no
+        # indexer state, which the model simply rebuilds.
+        incomplete: list[bool] = [False] * len(axis_info)
         for state in states:
             elements = state.get("states")
             if elements is None:
-                elements = tuple(
-                    state.get(info.name) for info in self.get_state_axis_info()
-                )
+                elements = tuple(state.get(info.name) for info in axis_info)
             for index, element in enumerate(elements):
-                if element is not None:
+                if element is None:
+                    incomplete[index] = True
+                else:
                     grouped[index].append(element)
         concatenated = []
-        for info, elements in zip(self.get_state_axis_info(), grouped):
-            concatenated.append(
-                mx.concatenate(elements, axis=info.sequence_axis) if elements else None
-            )
+        for index, (info, elements) in enumerate(zip(axis_info, grouped)):
+            if incomplete[index] or not elements:
+                concatenated.append(None)
+                continue
+            if info.name == "index_position_ids":
+                # Blocks of one sequence can carry different channel counts
+                # (text C=1 vs MRoPE C=3); widen before joining on S.
+                elements = _align_qsa_position_channels(elements)
+            concatenated.append(mx.concatenate(elements, axis=info.sequence_axis))
         return {
             **{
                 info.name: value
