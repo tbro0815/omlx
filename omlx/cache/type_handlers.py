@@ -1437,55 +1437,6 @@ def _serialize_qsa_positions(position_ids: Any) -> Any:
     )
 
 
-def _align_qsa_position_channels(elements: list[Any]) -> list[Any]:
-    """Broadcast ``[B, 1, S]`` text positions up to the widest channel count.
-
-    ``_serialize_qsa_positions`` fixes the *rank* at ``[B, C, S]`` but not
-    ``C``: a block stored while the request used plain text positions has
-    ``C == 1``, one stored under MRoPE has ``C == 3``. Concatenating a
-    sequence that spans both then fails on the non-sequence axis:
-
-        [concatenate] All the input array dimensions must match exactly
-        except for the concatenation axis. However, the provided shapes are
-        (1,1,2048), (1,3,2048), and the concatenation axis is 2.
-
-    which surfaced as "Failed to reconstruct cache" and a 100% re-prefill on
-    every turn of a long Qwen4-exp session.
-
-    Widening a text row to C replicates the single position across the MRoPE
-    channels, which is exactly what the model does at runtime when the two
-    layouts meet -- see ``_append_indexer_positions`` in the vendored
-    qwen4_exp language model, which broadcasts the 2-D side up before its own
-    concatenate. Narrowing instead would discard the h/w channels, so this
-    only ever widens.
-    """
-    if not HAS_MLX or len(elements) < 2:
-        return elements
-    channels = 0
-    for element in elements:
-        if element is None or getattr(element, "ndim", 0) != 3:
-            return elements
-        channels = max(channels, element.shape[1])
-    if channels <= 1 or all(e.shape[1] == channels for e in elements):
-        return elements
-    aligned = []
-    for element in elements:
-        if element.shape[1] == channels:
-            aligned.append(element)
-        elif element.shape[1] == 1:
-            aligned.append(
-                mx.broadcast_to(
-                    element, (element.shape[0], channels, element.shape[2])
-                )
-            )
-        else:
-            # Neither 1 nor the max: not a text/MRoPE pair, so there is no
-            # defined widening. Leave the list alone and let the concatenate
-            # raise rather than inventing channels.
-            return elements
-    return aligned
-
-
 def _deserialize_qsa_positions(position_ids: Any) -> Any:
     """Restore the model-facing text/MRoPE position layout."""
     if position_ids is None or not hasattr(position_ids, "ndim"):
@@ -1498,6 +1449,55 @@ def _deserialize_qsa_positions(position_ids: Any) -> Any:
     if position_ids.shape[1] == 1:
         return position_ids[:, 0, :]
     return position_ids.transpose(1, 0, 2)
+
+
+def _normalize_qsa_position_states(position_states: list[Any]) -> list[Any]:
+    """Promote mixed text/MRoPE QSA positions to [B, 3, S].
+
+    Qwen4 represents text positions as [B, S] and MRoPE positions as
+    [3, B, S]. Serialization stores those as [B, 1, S] and [B, 3, S]
+    respectively. The model's indexer cache promotes the text form by
+    broadcasting it across all three MRoPE coordinates when the two forms
+    meet, so block reconstruction must perform the equivalent operation
+    before concatenating along the sequence axis.
+    """
+    if not position_states:
+        return position_states
+
+    batch_size = None
+    channels: set[int] = set()
+    for position_state in position_states:
+        if not hasattr(position_state, "ndim") or position_state.ndim != 3:
+            shape = getattr(position_state, "shape", None)
+            raise ValueError(
+                "Serialized QSA position IDs must be [B, C, S], "
+                f"got {shape}."
+            )
+        current_batch, current_channels, _ = position_state.shape
+        if current_channels not in (1, 3):
+            raise ValueError(
+                "Serialized QSA position IDs require 1 text channel or 3 "
+                f"MRoPE channels, got {position_state.shape}."
+            )
+        if batch_size is None:
+            batch_size = current_batch
+        elif current_batch != batch_size:
+            raise ValueError(
+                "Serialized QSA position IDs must have a consistent batch "
+                f"dimension, got {batch_size} and {current_batch}."
+            )
+        channels.add(current_channels)
+
+    # Preserve both homogeneous paths without introducing broadcast views.
+    if len(channels) == 1:
+        return position_states
+
+    return [
+        mx.broadcast_to(state, (state.shape[0], 3, state.shape[2]))
+        if state.shape[1] == 1
+        else state
+        for state in position_states
+    ]
 
 
 class Qwen4QSAKVCacheHandler(CacheTypeHandler):
@@ -1616,8 +1616,9 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
                 continue
             if info.name == "index_position_ids":
                 # Blocks of one sequence can carry different channel counts
-                # (text C=1 vs MRoPE C=3); widen before joining on S.
-                elements = _align_qsa_position_channels(elements)
+                # (text C=1 vs MRoPE C=3); upstream's normalizer widens the
+                # text form to three MRoPE coordinates before joining on S.
+                elements = _normalize_qsa_position_states(elements)
             concatenated.append(mx.concatenate(elements, axis=info.sequence_axis))
         return {
             **{

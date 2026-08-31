@@ -16,6 +16,12 @@ sequence spanning both could not be concatenated, so reconstruct raised and
 the prefix cache returned ``reused 0`` forever while continuing to write
 snapshots that could never be read.
 
+Upstream fixed this in 0.6.4 (`119d2049`, issue #3219) with
+``_normalize_qsa_position_states``, which is the implementation exercised
+here; the omni ``_align_qsa_position_channels`` it replaced is gone. The
+slice-clamping and incomplete-block cases below cover omni-only fixes in
+``slice_state`` / ``concatenate_states`` that 0.6.4 did not take.
+
 These tests need real ``mlx`` -- they run on Apple Silicon, not in CI
 containers. They allocate a handful of tiny tensors and never load a model.
 """
@@ -28,8 +34,8 @@ from omlx.cache.type_handlers import (  # noqa: E402
     Qwen4BatchQSAKVCacheHandler,
     Qwen4QSAKVCacheHandler,
     Qwen4QSAQuantizedKVCacheHandler,
-    _align_qsa_position_channels,
     _deserialize_qsa_positions,
+    _normalize_qsa_position_states,
     _serialize_qsa_positions,
 )
 
@@ -73,7 +79,7 @@ def _block(positions, fill=0.0, seq=S):
 
 
 # --------------------------------------------------------------------------
-# _align_qsa_position_channels
+# _normalize_qsa_position_states
 # --------------------------------------------------------------------------
 
 
@@ -93,16 +99,16 @@ def test_mixed_blocks_are_unconcatenable_without_alignment():
         mx.eval(mx.concatenate(blocks, axis=2))
 
 
-def test_align_widens_text_to_mrope():
-    aligned = _align_qsa_position_channels(
+def test_normalize_widens_text_to_mrope():
+    normalized = _normalize_qsa_position_states(
         [
             _serialize_qsa_positions(_text_positions(7)),
             _serialize_qsa_positions(_mrope_positions(0)),
         ]
     )
-    assert [tuple(a.shape) for a in aligned] == [(B, 3, S), (B, 3, S)]
+    assert [tuple(a.shape) for a in normalized] == [(B, 3, S), (B, 3, S)]
 
-    joined = mx.concatenate(aligned, axis=2)
+    joined = mx.concatenate(normalized, axis=2)
     mx.eval(joined)
     assert tuple(joined.shape) == (B, 3, 2 * S)
 
@@ -116,38 +122,48 @@ def test_align_widens_text_to_mrope():
         assert mx.all(joined[0, channel, S:] == expected).item()
 
 
-def test_align_is_a_noop_for_uniform_blocks():
-    """Uniform input must be returned unchanged, without reallocating."""
+def test_normalize_is_a_noop_for_uniform_blocks():
+    """Uniform input is returned unchanged, without broadcast views."""
     text = [_serialize_qsa_positions(_text_positions(i)) for i in range(3)]
-    assert _align_qsa_position_channels(text) is text
+    assert _normalize_qsa_position_states(text) is text
 
     mrope = [_serialize_qsa_positions(_mrope_positions(i)) for i in range(3)]
-    assert _align_qsa_position_channels(mrope) is mrope
+    assert _normalize_qsa_position_states(mrope) is mrope
 
 
-def test_align_never_narrows_or_invents_channels():
-    """A combination with no defined widening is handed back untouched.
+def test_normalize_rejects_channel_counts_it_cannot_promote():
+    """Upstream fails loudly rather than fabricating coordinates.
 
-    Better a loud concatenate failure than silently fabricated channels.
+    The omni helper handed unrecognized shapes back untouched and let the
+    concatenate raise. Upstream validates up front; either way nothing is
+    invented, but the error now names the cause.
     """
     two = mx.zeros((B, 2, S), dtype=mx.int32)
     three = _serialize_qsa_positions(_mrope_positions(0))
-    out = _align_qsa_position_channels([two, three])
-    assert [tuple(a.shape) for a in out] == [(B, 2, S), (B, 3, S)]
+    with pytest.raises(ValueError, match="1 text channel or 3"):
+        _normalize_qsa_position_states([two, three])
 
 
-@pytest.mark.parametrize(
-    "elements",
-    [
-        [],
-        [mx.zeros((B, 1, S), dtype=mx.int32)],
-        [mx.zeros((B, 1, S), dtype=mx.int32), None],
-        [mx.zeros((B, S), dtype=mx.int32), mx.zeros((B, 1, S), dtype=mx.int32)],
-    ],
-    ids=["empty", "single", "with-none", "unexpected-rank"],
-)
-def test_align_passes_degenerate_input_through(elements):
-    assert _align_qsa_position_channels(elements) is elements
+def test_normalize_rejects_non_three_dimensional_states():
+    with pytest.raises(ValueError, match=r"\[B, C, S\]"):
+        _normalize_qsa_position_states(
+            [mx.zeros((B, S), dtype=mx.int32), mx.zeros((B, 1, S), dtype=mx.int32)]
+        )
+
+
+def test_normalize_rejects_inconsistent_batch_dimensions():
+    with pytest.raises(ValueError, match="consistent batch"):
+        _normalize_qsa_position_states(
+            [
+                mx.zeros((B, 1, S), dtype=mx.int32),
+                mx.zeros((B + 1, 3, S), dtype=mx.int32),
+            ]
+        )
+
+
+@pytest.mark.parametrize("elements", [[], [mx.zeros((B, 1, S), dtype=mx.int32)]])
+def test_normalize_passes_trivial_input_through(elements):
+    assert _normalize_qsa_position_states(elements) is elements
 
 
 # --------------------------------------------------------------------------

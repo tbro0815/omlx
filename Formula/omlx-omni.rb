@@ -24,9 +24,9 @@ class OmlxOmni < Formula
   #
   # A class-body local, not a constant: Homebrew may load a formula file more
   # than once per run, and a constant would warn about redefinition.
-  omni_tag = "v0.6.3-omni"
-  omni_version = "0.6.3"
-  omni_branch = "omni/v0.6.3"
+  omni_tag = "v0.6.4-omni"
+  omni_version = "0.6.4"
+  omni_branch = "omni/v0.6.4"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
@@ -38,7 +38,7 @@ class OmlxOmni < Formula
   head "https://github.com/tbro0815/omlx.git", branch: omni_branch
 
   option "with-custom-kernel",
-         "Build native custom kernels for GLM-5.2, MiniMax M3 and Qwen3.5/3.6 acceleration"
+         "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6/4 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
@@ -78,6 +78,23 @@ class OmlxOmni < Formula
     environment_variables PATH: std_service_path_env
   end
 
+  # Keep in sync with CUSTOM_KERNELS in upstream's Formula/omlx.rb.
+  def custom_kernels
+    %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill]
+  end
+
+  def verify_custom_kernels(python)
+    system python, "-c", <<~PYTHON
+      import importlib
+      failed = {}
+      for package in #{custom_kernels.inspect}:
+          fast = importlib.import_module(f"omlx.custom_kernels.{package}.fast")
+          if not fast.is_native_available():
+              failed[package] = str(fast.import_error())
+      assert not failed, failed
+    PYTHON
+  end
+
   def install
     # Create venv with pip so dependency resolution works properly
     system "python3.11", "-m", "venv", libexec
@@ -112,11 +129,9 @@ class OmlxOmni < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
-      kernel_sources = [
-        buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
-        buildpath/"omlx/custom_kernels/minimax_m3/csrc",
-        buildpath/"omlx/custom_kernels/qwen35_prefill/csrc",
-      ]
+      kernel_sources = custom_kernels.map do |kernel|
+        buildpath/"omlx/custom_kernels/#{kernel}/csrc"
+      end
       unless kernel_sources.all?(&:directory?)
         odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
       end
@@ -146,14 +161,7 @@ class OmlxOmni < Formula
       # Run from libexec so buildpath's raw omlx/ source tree doesn't shadow
       # the compiled package in the venv's site-packages.
       Dir.chdir(libexec) do
-        system libexec/"bin/python", "-c", <<~PYTHON
-          from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-          from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
-          from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
-          assert glm_fast.is_native_available(), glm_fast.import_error()
-          assert minimax_fast.is_native_available(), minimax_fast.import_error()
-          assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
-        PYTHON
+        verify_custom_kernels(libexec/"bin/python")
       end
     end
 
@@ -312,14 +320,7 @@ class OmlxOmni < Formula
     end
 
     ohai "  verifying custom kernel imports..."
-    system python, "-c", <<~PYTHON
-      from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-      from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
-      from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
-      assert glm_fast.is_native_available(), glm_fast.import_error()
-      assert minimax_fast.is_native_available(), minimax_fast.import_error()
-      assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
-    PYTHON
+    verify_custom_kernels(python)
   end
 
   test do
@@ -327,14 +328,7 @@ class OmlxOmni < Formula
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
     if build.with?("custom-kernel")
-      system libexec/"bin/python", "-c", <<~PYTHON
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
-        from omlx.custom_kernels.qwen35_prefill import fast as qwen35_fast
-        assert glm_fast.is_native_available(), glm_fast.import_error()
-        assert minimax_fast.is_native_available(), minimax_fast.import_error()
-        assert qwen35_fast.is_native_available(), qwen35_fast.import_error()
-      PYTHON
+      verify_custom_kernels(libexec/"bin/python")
     end
   end
 end
