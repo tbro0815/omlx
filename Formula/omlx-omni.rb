@@ -24,9 +24,9 @@ class OmlxOmni < Formula
   #
   # A class-body local, not a constant: Homebrew may load a formula file more
   # than once per run, and a constant would warn about redefinition.
-  omni_tag = "v0.6.4-omni"
-  omni_version = "0.6.4"
-  omni_branch = "omni/v0.6.4"
+  omni_tag = "v0.7.0.dev2-omni"
+  omni_version = "0.7.0.dev2"
+  omni_branch = "omni/v0.7.0"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
