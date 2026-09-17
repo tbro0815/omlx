@@ -32,7 +32,7 @@ class OmlxOmni < Formula
   homepage "https://github.com/tbro0815/omlx"
   url "https://github.com/tbro0815/omlx/archive/refs/tags/#{omni_tag}.tar.gz"
   version omni_version
-  sha256 "27b488f1720eb1c31d61373e13ce433547e420c9c39ee6d4bdb008b66fe1db10"
+  sha256 "7714c5a0ab5a494d365977c60cffcc06f6f4f9ee44a67878c47204e72338a39b"
   license "Apache-2.0"
 
   head "https://github.com/tbro0815/omlx.git", branch: omni_branch
