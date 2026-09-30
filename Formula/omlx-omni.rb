@@ -117,7 +117,9 @@ class OmlxOmni < Formula
     # source build fails with undefined _Py* symbols. Pass it explicitly.
     ENV.append "RUSTFLAGS", "-C link-arg=-undefined -C link-arg=dynamic_lookup"
 
-    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
+    # watchfiles arrives via mlx-audio[all] -> uvicorn[standard]; its prebuilt
+    # wheel has no header padding, so Homebrew cannot rewrite its dylib ID.
+    no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken,watchfiles"
     pip_flags = []
     if MacOS.version >= "27"
       # macOS 27's dyld requires the LC_SYMTAB string pool to start on an
