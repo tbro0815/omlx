@@ -144,7 +144,7 @@ Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/
 
 ### macOS App
 
-Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it. To connect OpenClaw, OpenCode, Codex, Hermes Agent, or Copilot, see [Integrations](#integrations).
+Launch oMLX from your Applications folder. The Welcome screen guides you through three steps - model directory, server start, and first model download. That's it. To connect OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, or DeepSeek Harness, see [Integrations](#integrations).
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX Welcome Screen" width="360">
@@ -214,7 +214,7 @@ checklist.
 
 ### Vision-Language Models
 
-Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
+Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
 
 ### Tiered KV Cache (Hot + Cold)
 
@@ -233,7 +233,7 @@ Handles concurrent requests through mlx-lm's BatchGenerator. Max concurrent requ
 
 ### Claude Code Optimization
 
-Context scaling support for running smaller context models with Claude Code. Scales reported token counts so that auto-compact triggers at the right timing, and SSE keep-alive prevents read timeouts during long prefill.
+Runs smaller context models with Claude Code by reporting the model's real context window to auto-compact instead of scaling token counts, and SSE keep-alive prevents read timeouts during long prefill.
 
 ### Multi-Model Serving
 
@@ -276,7 +276,7 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
 
 ### Integrations
 
-Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, and Pi directly from the admin dashboard with a single click. No manual config editing required.
+Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, and DeepSeek Harness directly from the admin dashboard with a single click. No manual config editing required.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
@@ -388,9 +388,18 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost-only: skip verification via admin panel global settings
+
+# Network access requires authentication
+OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 ```
 
-All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
+
+
+Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. The existing `skip_api_key_verification` option remains restricted to loopback-only binds.
+
+For keyless inference, stop oMLX, manually set `auth.allow_unauthenticated_inference` to `true` in `settings.json`, and restart. It defaults to `false` and has no UI toggle. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. On network binds, keep a main API key configured and `skip_api_key_verification` set to `false`; management endpoints still require authentication.
 
 <details>
 <summary>Architecture</summary>
@@ -469,5 +478,6 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
+- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating

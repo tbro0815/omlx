@@ -418,7 +418,9 @@ class TestCompileBareGrammar:
         schema = {"type": "object"}
         result = self._call(compiler, {"type": "json_schema", "json_schema": schema})
         assert result == "compiled_json"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps(schema), max_whitespace_cnt=32
+        )
 
     def test_empty_json_schema(self):
         compiler = MagicMock()
@@ -482,7 +484,12 @@ class TestCompileGrammarForRequest:
             "json": {"type": "object", "properties": {"x": {"type": "integer"}}},
         })
         assert result == "compiled_json"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps(
+                {"type": "object", "properties": {"x": {"type": "integer"}}}
+            ),
+            max_whitespace_cnt=32,
+        )
 
     def test_bare_regex(self):
         compiler = MagicMock()
@@ -573,7 +580,9 @@ class TestCompileGrammarForRequest:
             reasoning_parser=None,
         )
         assert result == "compiled_bare"
-        compiler.compile_json_schema.assert_called_once()
+        compiler.compile_json_schema.assert_called_once_with(
+            json.dumps({"type": "object"}), max_whitespace_cnt=32
+        )
         compiler.compile_structural_tag.assert_not_called()
 
     def test_compilation_error_raises_for_structured_outputs(self):
@@ -1061,41 +1070,6 @@ class TestGrammarProcessorAdvance:
         comp, vs = compiler
         proc = GrammarConstraintProcessor(comp.compile_grammar('root ::= "x"'), vs)
         assert isinstance(proc.matcher, xgr.GrammarMatcher)
-
-
-# =========================================================================
-# _apply_batched_grammar (scheduler _step integration)
-# =========================================================================
-
-class TestApplyBatchedGrammar:
-    """Tests for the batched grammar path in _step."""
-
-    @pytest.fixture()
-    def setup(self):
-        xgr = pytest.importorskip("xgrammar")
-        vocab = [f"<tok_{i}>" for i in range(256)]
-        vocab[ord("a")] = "a"
-        vocab[ord("b")] = "b"
-        vocab[ord("{")] = "{"
-        vocab[ord("}")] = "}"
-        ti = xgr.TokenizerInfo(vocab)
-        comp = xgr.GrammarCompiler(ti)
-        return comp, len(vocab)
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_batched_grammar_masks_logits(self, setup):
-        """Batched grammar correctly masks logits for multiple requests."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_non_grammar_processors_still_run(self, setup):
-        """ThinkingBudgetProcessor and other processors still run per-request."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_terminated_processors_skipped(self, setup):
-        """Terminated grammar processors don't participate in batch fill."""
-        pass
 
 
 # =========================================================================

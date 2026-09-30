@@ -22,10 +22,15 @@ class OmlxOmni < Formula
   # Fork identity lives in the keg name (omlx-omni) and in oMLX's own
   # __display_version__ ("0.6.3-omni"), which is what the UI and CLI show.
   #
+  # ".devN" is NOT covered by that: "0.7.0.dev2" tokenizes as
+  # [0, 7, 0, "dev", 2] with a plain StringToken, which sorts ABOVE NullToken,
+  # so the final "0.7.0" ranks below its own dev build and `brew upgrade`
+  # does nothing. omni-upgrade.sh detects that and falls back to reinstall.
+  #
   # A class-body local, not a constant: Homebrew may load a formula file more
   # than once per run, and a constant would warn about redefinition.
-  omni_tag = "v0.7.0.dev2-omni"
-  omni_version = "0.7.0.dev2"
+  omni_tag = "v0.7.0-omni"
+  omni_version = "0.7.0"
   omni_branch = "omni/v0.7.0"
 
   desc "oMLX with Jang and external-model support"
@@ -105,6 +110,10 @@ class OmlxOmni < Formula
     # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+    # PyO3 0.29 (tokenizers 0.23) no longer emits macOS's
+    # `-undefined dynamic_lookup` for extension modules on its own, so a
+    # source build fails with undefined _Py* symbols. Pass it explicitly.
+    ENV.append "RUSTFLAGS", "-C link-arg=-undefined -C link-arg=dynamic_lookup"
 
     no_binary = "cohere_melody,pydantic-core,rpds-py,tiktoken"
     pip_flags = []

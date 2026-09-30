@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import re
 import secrets
 import subprocess
@@ -102,6 +103,7 @@ from .planner import (
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status
+from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -142,6 +144,8 @@ from .worker_bundle import (
     worker_source_bundle,
     worker_source_digest,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
@@ -3534,10 +3538,13 @@ async def _activate_and_report(
         except BaseException as exc:
             # A deployment is not active merely because it passed planning.
             # Remove the failed engine first, then restore the exact registry
-            # record clients saw before this request.
+            # record clients saw before this request. Rollback errors are only
+            # logged, so the caller still gets the readiness failure.
             try:
                 await pool.prepare_cluster_reload(model_id)
-            finally:
+            except Exception:
+                logger.exception("Could not unload failed cluster model %s", model_id)
+            try:
                 if previous is None:
                     await asyncio.to_thread(
                         registry.remove,
@@ -3552,6 +3559,10 @@ async def _activate_and_report(
                         unregister(model_id)
                 else:
                     await asyncio.to_thread(registry.upsert, previous)
+            except Exception:
+                logger.exception(
+                    "Could not restore the cluster registry for %s", model_id
+                )
             if isinstance(exc, Exception):
                 raise DistributedLaunchError(
                     f"Cluster readiness check failed: {exc}"
@@ -3980,8 +3991,9 @@ async def load_cluster_deployment(deployment_id: str):
             )
         entry = pool.get_entry(model_id)
         resident = getattr(entry, "engine", None) if entry is not None else None
-        if resident is not None and getattr(
-            resident, "runtime_failed_reason", None
+        if resident is not None and (
+            getattr(resident, "runtime_failed_reason", None)
+            or getattr(entry, "pending_unload_reason", None)
         ):
             await pool.prepare_cluster_reload(model_id)
         engine = await pool.get_engine(model_id)
@@ -4015,3 +4027,8 @@ async def load_cluster_deployment(deployment_id: str):
         "canary_completion_tokens": canary.completion_tokens,
         "ranks": status.get("ranks", []),
     }
+
+
+# RDMA links over MCDMA: inventory with live evidence, and on-demand verification.
+router.add_api_route("/rdma-links", cluster_rdma_links, methods=["GET"])
+router.add_api_route("/rdma-links/verify", cluster_rdma_link_verify, methods=["POST"])

@@ -146,6 +146,7 @@ from .api.responses_utils import (
     ResponseStateCorruptError,
     ResponseStateNotFoundError,
     ResponseStore,
+    apply_namespace_tool_aliases,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -155,17 +156,19 @@ from .api.responses_utils import (
     convert_responses_tools,
     format_sse_event,
     normalize_response_output_to_messages,
+    split_namespace_tool_name,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallExtraction,
     ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
-    parse_tool_calls,
     parse_json_output,
+    parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
@@ -262,6 +265,9 @@ class ServerState:
     mcp_executor: Optional[object] = None
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
+    # Bind address snapshot for security checks. Unlike GlobalSettings.server.host,
+    # this remains unchanged until the process restarts on the new address.
+    bind_host: str | None = None
     settings_manager: Optional[object] = None  # ModelSettingsManager
     external_registry: Optional[object] = None  # ExternalModelRegistry
     global_settings: Optional[object] = None  # GlobalSettings
@@ -319,21 +325,35 @@ async def verify_api_key(
     request: FastAPIRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> bool:
-    """Verify API key if configured.
+    """Verify API key unless an explicitly loopback-only server allows no auth.
 
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
     from .admin.auth import fingerprint_key, verify_any_api_key
+    from .utils.network import is_loopback_bind
 
-    # No auth required if no API key is configured
+    global_settings = _server_state.global_settings
+    configured_host = getattr(
+        getattr(global_settings, "server", None), "host", None
+    )
+    if not isinstance(configured_host, str):
+        configured_host = None
+    bind_host = getattr(_server_state, "bind_host", None)
+    active_host = bind_host if isinstance(bind_host, str) else configured_host
+    loopback_only = active_host is None or is_loopback_bind(active_host)
+
+    # A missing key is accepted only when the configured bind is loopback-only.
     if _server_state.api_key is None:
-        return True
+        if loopback_only:
+            return True
+        raise HTTPException(status_code=401, detail="API key required")
 
     # Skip verification if enabled
     if (
-        _server_state.global_settings is not None
-        and _server_state.global_settings.auth.skip_api_key_verification
+        global_settings is not None
+        and global_settings.auth.skip_api_key_verification
+        and loopback_only
     ):
         return True
 
@@ -348,8 +368,8 @@ async def verify_api_key(
 
     # Check main key and sub keys
     sub_keys = (
-        _server_state.global_settings.auth.sub_keys
-        if _server_state.global_settings is not None
+        global_settings.auth.sub_keys
+        if global_settings is not None
         else []
     )
     if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
@@ -357,6 +377,24 @@ async def verify_api_key(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     return True
+
+
+def allows_unauthenticated_inference() -> bool:
+    settings = _server_state.global_settings
+    return (
+        settings is not None
+        and settings.auth.allow_unauthenticated_inference is True
+    )
+
+
+async def verify_inference_api_key(
+    request: FastAPIRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> bool:
+    """Allow the manual inference opt-in without changing management auth."""
+    if allows_unauthenticated_inference():
+        return True
+    return await verify_api_key(request, credentials)
 
 
 def distributed_inference_enabled() -> bool:
@@ -628,6 +666,18 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Resume persisted download queues after settings and model dirs are set.
+    if _server_state.hf_downloader is not None:
+        try:
+            await _server_state.hf_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("HF download queue restore failed: %s", exc)
+    if _server_state.ms_downloader is not None:
+        try:
+            await _server_state.ms_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("MS download queue restore failed: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -690,14 +740,14 @@ from .api.mcp_routes import router as mcp_router
 from .api.mcp_routes import set_mcp_manager_getter
 
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
+app.include_router(mcp_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include web search routes (chat UI built-in web_search / fetch_url tools)
 from .api.websearch_routes import router as websearch_router
 from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
 
 _set_websearch_settings(lambda: _server_state.global_settings)
-app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -708,9 +758,9 @@ try:
     from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
-    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(audio_router, dependencies=[Depends(verify_inference_api_key)])
     # The realtime WebSocket router authenticates in-band (first message):
-    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # HTTP auth dependencies cannot resolve WebSocket scopes, and browsers cannot set an
     # Authorization header on WebSocket connections.
     app.include_router(audio_realtime_router)
     del _
@@ -833,6 +883,7 @@ def _is_api_route(request: FastAPIRequest) -> bool:
     classified as non-API. Switch to ``request.scope.get("route")``
     matching at that point.
     """
+
     return request.url.path.startswith("/v1/")
 
 
@@ -867,7 +918,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        content = _openai_error_body(
+            exc.detail, exc.status_code, code=getattr(exc, "code", None)
+        )
     else:
         content = {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=content)
@@ -1946,6 +1999,38 @@ def _resolve_metric_durations(
     return prefill_duration, generation_duration
 
 
+def _usage_timing_fields(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    ttft: float | None,
+    prefill_duration: float,
+    generation_duration: float,
+    cached_tokens: int = 0,
+) -> dict:
+    """Timing fields for a non-streaming Usage, computed like the final streaming chunk.
+
+    The prompt rate counts only the tokens prefilled in this request: cached
+    prefix tokens were restored, not computed, during prefill_duration.
+    """
+    computed = max(prompt_tokens - (cached_tokens or 0), 0)
+    return {
+        "time_to_first_token": round(ttft, 2) if ttft is not None else None,
+        "prompt_eval_duration": (
+            round(prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_duration": round(generation_duration, 2),
+        "prompt_tokens_per_second": (
+            round(computed / prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_tokens_per_second": (
+            round(completion_tokens / generation_duration, 2)
+            if generation_duration > 0
+            else None
+        ),
+    }
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -2075,15 +2160,40 @@ def init_server(
         - Sampling parameters (max_tokens, temperature, etc.) are per-model settings
 
     Raises:
-        ValueError: If model directory doesn't exist or no models found
+        ValueError: If network authentication is unsafe, the model directory
+            doesn't exist, or no models are found.
     """
     from pathlib import Path
 
     from .model_settings import ModelSettingsManager
+    from .utils.network import network_auth_error
+
+    if global_settings is not None:
+        auth_error = network_auth_error(
+            global_settings.server.host,
+            api_key,
+            global_settings.auth.skip_api_key_verification,
+        )
+        if auth_error:
+            raise ValueError(auth_error)
+
+    if global_settings is not None:
+        global_settings.ensure_inference_auth_setting()
 
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    _server_state.bind_host = (
+        global_settings.server.host if global_settings is not None else None
+    )
+    if allows_unauthenticated_inference():
+        logger.warning(
+            "Unauthenticated inference is enabled on %s. Anyone who can connect "
+            "can use inference, stored Responses, audio, MCP tools, and web "
+            "search/fetch. Management endpoints still require authentication "
+            "on non-loopback binds.",
+            _server_state.bind_host,
+        )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -2179,9 +2289,13 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    _server_state.engine_pool.configure_gpu_keep_warm(
+        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
+    )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
+    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2191,6 +2305,7 @@ def init_server(
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_rdma_link_store(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
     # Cluster v2: stable node identity + trusted device inventory. Best
@@ -2286,6 +2401,13 @@ def init_server(
     # Initialize HuggingFace downloader
     from .admin.hf_downloader import HFDownloader
     from .admin.routes import set_hf_downloader
+    from .settings import resolve_default_base_path
+
+    tasks_base = (
+        Path(global_settings.base_path)
+        if global_settings is not None
+        else resolve_default_base_path()
+    )
 
     async def _refresh_models_after_download():
         """Re-discover models when a HuggingFace download completes."""
@@ -2300,6 +2422,7 @@ def init_server(
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        tasks_file=tasks_base / "hf_download_tasks.json",
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -2314,6 +2437,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                tasks_file=tasks_base / "ms_download_tasks.json",
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")
@@ -2701,7 +2825,11 @@ async def _with_json_keepalive(
             logger.warning(
                 "JSON keepalive request failed (%d): %s", e.status_code, e.detail
             )
-            yield json.dumps(_openai_error_body(e.detail, e.status_code))
+            yield json.dumps(
+                _openai_error_body(
+                    e.detail, e.status_code, code=getattr(e, "code", None)
+                )
+            )
             return
         if result is not None:
             yield result
@@ -3200,7 +3328,7 @@ async def _create_markitdown_chat_completion(
 
 
 @app.get("/v1/models")
-async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3405,7 +3533,7 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 async def create_embeddings(
     request: EmbeddingRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create embeddings for input text(s).
@@ -3552,7 +3680,7 @@ def normalize_documents(documents: list[str] | list[dict]) -> list[str]:
 @app.post("/v1/rerank")
 async def create_rerank(
     request: RerankRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ) -> RerankResponse:
     """
     Rerank documents by relevance to a query.
@@ -3658,7 +3786,7 @@ async def create_rerank(
 async def create_completion(
     request: CompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3820,11 +3948,12 @@ async def create_completion(
                 f"({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
-            prefill_duration = (
+            ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
+            prefill_duration = ttft if ttft is not None else 0.0
             gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
@@ -3852,6 +3981,18 @@ async def create_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **(
+                        _usage_timing_fields(
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            ttft=ttft,
+                            prefill_duration=prefill_duration,
+                            generation_duration=gen_duration,
+                            cached_tokens=total_cached_tokens,
+                        )
+                        if len(prompts) == 1
+                        else {}
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -3867,7 +4008,7 @@ async def create_completion(
 async def create_chat_completion(
     request: ChatCompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a chat completion.
@@ -4313,13 +4454,16 @@ async def create_chat_completion(
             ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
-            gen_duration = elapsed - ttft if ttft > 0 else elapsed
+            metric_prefill = ttft if ttft is not None else 0.0
+            gen_duration = (
+                elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            )
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                prefill_duration=ttft,
+                prefill_duration=metric_prefill,
                 generation_duration=gen_duration,
             )
 
@@ -4335,7 +4479,9 @@ async def create_chat_completion(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -4350,9 +4496,12 @@ async def create_chat_completion(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Process response_format if specified
@@ -4405,6 +4554,14 @@ async def create_chat_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **_usage_timing_fields(
+                        output.prompt_tokens,
+                        output.completion_tokens,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=output.cached_tokens,
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -4635,6 +4792,9 @@ def _compile_with_structural_tag(
     return compiler.compile_structural_tag(tag_dict)
 
 
+_JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
+
+
 def _compile_bare_grammar(compiler, fmt: dict):
     """Compile a grammar without any structural tag wrapping."""
     if fmt["type"] == "json_schema":
@@ -4644,7 +4804,15 @@ def _compile_bare_grammar(compiler, fmt: dict):
         if not schema:
             return compiler.compile_builtin_json_grammar()
         schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
-        return compiler.compile_json_schema(schema_str)
+        # An unlimited whitespace run can trap a grammar-constrained decoder
+        # after an early string termination: whitespace remains valid while
+        # every useful token is masked.  Keep the bound local to the compiler
+        # call so ordinary JSON and user-supplied EBNF/regex grammars retain
+        # their existing behavior.
+        return compiler.compile_json_schema(
+            schema_str,
+            max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+        )
     elif fmt["type"] == "grammar":
         return compiler.compile_grammar(fmt["grammar"])
     elif fmt["type"] == "regex":
@@ -5001,19 +5169,14 @@ async def stream_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ).model_dump(exclude_none=True),
             }
@@ -5087,6 +5250,29 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+class _ToolCallGenerationError(HTTPException):
+    """Keep generation failure codes through JSON keepalive responses."""
+
+    def __init__(self, error: dict):
+        super().__init__(status_code=500, detail=error["message"])
+        self.code = error["code"]
+
+
+def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
+    failed = extraction.parse_errors
+    if not failed:
+        return None
+    code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
+    message = (
+        "Model output contains an unrecoverable tool call. "
+        "Previously delivered tool calls must not be executed again on retry."
+    )
+    logger.warning(
+        "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
+    )
+    return _openai_error_body(message, 500, code=code)
+
+
 def _registered_tool_names(tools: object) -> set[str]:
     """Return nonempty function names explicitly registered by the request."""
 
@@ -5110,8 +5296,8 @@ def _registered_tool_names(tools: object) -> set[str]:
 def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
     """Canonical name/JSON-object identity, or ``None`` when malformed.
 
-    This is syntactic validation plus the separate registered-name check at the
-    call site; it is deliberately not full JSON Schema argument validation.
+    Unknown names remain callable output for client-side error feedback.
+    This is syntactic validation, not full JSON Schema argument validation.
     """
 
     function = getattr(tool_call, "function", None)
@@ -5252,13 +5438,16 @@ async def stream_chat_completion(
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
+            tools=kwargs.get("tools"),
             capture_ordered_segments=stream_completed_qwen_tools,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5376,10 +5565,11 @@ async def stream_chat_completion(
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _cleaned, completed_calls = parse_tool_calls(
+                        _, completed_calls, _ = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
+                            finish_reason="stop",
                         )
                         completed_calls = completed_calls or []
                         completed_keys = [
@@ -5388,11 +5578,6 @@ async def stream_chat_completion(
                         if (
                             not completed_calls
                             or any(key is None for key in completed_keys)
-                            or any(
-                                key[0] not in registered_tool_names
-                                for key in completed_keys
-                                if key is not None
-                            )
                         ):
                             stream_tool_sequence_safe = False
                             continue
@@ -5437,9 +5622,14 @@ async def stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5514,6 +5704,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
@@ -5523,31 +5714,21 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         cleaned_thinking = extraction.cleaned_thinking
-        if tool_calls and qwen_tool_envelope_streaming_capable:
-            # Raw-text parsing is never allowed to promote malformed or
-            # unregistered functions on the explicitly capability-gated qwen
-            # early-stream path. Other parser families retain their existing
-            # terminal semantics; engine-native structured calls above are
-            # authoritative and intentionally bypass this API-layer filter.
-            tool_calls = [
-                tool_call
-                for tool_call in tool_calls
-                if (
-                    (key := _tool_call_semantic_key(tool_call)) is not None
-                    and key[0] in registered_tool_names
-                )
-            ]
-
         # Process response_format if specified
         if request.response_format and not tool_calls:
             cleaned_text, parsed_json, is_valid, error = parse_json_output(
@@ -5598,7 +5779,7 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5701,6 +5882,11 @@ async def stream_chat_completion(
             event = f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
             mark_visible_delta()
             yield event
+
+    if tool_failure:
+        yield f"data: {json.dumps(tool_failure)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # Final chunk with finish_reason
     finish_reason = (
@@ -5811,26 +5997,19 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=(
-                        round(model_ttft, 2) if model_ttft is not None else None
-                    ),
                     time_to_first_visible_token=(
                         round(visible_ttft, 2)
                         if visible_ttft is not None
                         else None
                     ),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=model_ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ),
             )
@@ -5902,12 +6081,17 @@ async def stream_anthropic_messages(
     tool_filter = None
     thinking_filter = None
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -5946,8 +6130,9 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -6035,8 +6220,13 @@ async def stream_anthropic_messages(
         yield create_message_stop_event()
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=last_output is not None and last_output.finish_reason == "length"
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6110,26 +6300,32 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    tool_failure = None
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
                 yield create_content_block_stop_event(index=block_index)
@@ -6207,6 +6403,22 @@ async def stream_anthropic_messages(
             # Close tool block
             yield create_content_block_stop_event(index=i)
 
+    if tool_failure:
+        error = tool_failure["error"]
+        yield format_sse_event(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": error["message"],
+                    "code": error["code"],
+                },
+            },
+        )
+        yield create_message_stop_event()
+        return
+
     # 6. Send message_delta with stop_reason and actual token counts
     stop_reason = map_finish_reason_to_stop_reason(
         output.finish_reason if output else "stop", bool(tool_calls)
@@ -6259,7 +6471,7 @@ async def stream_anthropic_messages(
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a message using Anthropic Messages API format.
@@ -6606,7 +6818,9 @@ async def create_anthropic_message(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -6621,9 +6835,12 @@ async def create_anthropic_message(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=internal_tools,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -6663,7 +6880,7 @@ async def create_anthropic_message(
 @app.post("/v1/messages/count_tokens")
 async def count_anthropic_tokens(
     request: TokenCountRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Count tokens in a message request.
@@ -6790,7 +7007,7 @@ def _store_response_state(
 async def create_response(
     request: ResponsesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -6840,8 +7057,11 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
 
-        # Convert tools: flat → nested
-        openai_tools = convert_responses_tools(request.tools)
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
+        namespace_aliases: dict = {}
+        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
         if (
             getattr(engine, "is_diffusion_model", False)
             and not getattr(engine, "supports_tool_calling", False)
@@ -6921,18 +7141,19 @@ async def create_response(
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools
-        effective_tools = (
-            None
-            if (
-                getattr(engine, "is_diffusion_model", False)
-                and not getattr(engine, "supports_tool_calling", False)
-            )
-            else openai_tools
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
         )
+        effective_tools = None if tools_disabled else openai_tools
         if (
             _server_state.mcp_manager
-            and effective_tools
+            and not tools_disabled
             and mcp_tools_exposed()
         ):
             effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
@@ -7103,6 +7324,7 @@ async def create_response(
                                 resolved_model=resolved_model,
                                 response_format=response_format,
                                 native_reasoning=native_reasoning,
+                                namespace_aliases=namespace_aliases,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -7151,7 +7373,9 @@ async def create_response(
 
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
 
             # Parse tool calls
             if output.tool_calls:
@@ -7166,9 +7390,12 @@ async def create_response(
                     regular_content,
                     tokenizer=engine.tokenizer,
                     tools=tools_for_template,
+                    finish_reason=output.finish_reason,
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
+                if failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
             # Reverse Gemma 4 parameter renaming
@@ -7216,11 +7443,13 @@ async def create_response(
                         arguments = tc.get("arguments", "{}")
                     else:
                         continue
+                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
                     output_items.append(
                         build_function_call_output_item(
                             name=name,
                             arguments=arguments,
                             call_id=call_id,
+                            namespace=namespace,
                         )
                     )
 
@@ -7283,6 +7512,7 @@ async def stream_responses_api(
     resolved_model: Optional[str] = None,
     response_format=None,
     native_reasoning: bool = False,
+    namespace_aliases: Optional[dict] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -7532,12 +7762,17 @@ async def stream_responses_api(
     thinking_filter = None
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
         _thinking_filter = ToolCallStreamFilter(
-            engine.tokenizer, consume_dsml_separator=False
+            engine.tokenizer,
+            tools=kwargs.get("tools"),
+            consume_dsml_separator=False,
         )
         if _content_filter.active:
             tool_filter = _content_filter
@@ -7545,8 +7780,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -7612,9 +7848,14 @@ async def stream_responses_api(
         )
         return
 
+    finally:
+        await _aclose_async_iterator(engine_stream)
+
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -7668,20 +7909,26 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    tool_failure = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
+            finish_reason=last_output.finish_reason if last_output else "stop",
         )
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
+        tool_failure = _tool_call_failure(extraction)
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
@@ -7706,14 +7953,17 @@ async def stream_responses_api(
             )
     else:
         # No tools — use raw accumulated text minus thinking.
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     recovered_thinking = (
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if not tool_calls:
+    if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
         if recovered_content:
@@ -7852,6 +8102,7 @@ async def stream_responses_api(
             else:
                 continue
 
+            namespace, name = split_namespace_tool_name(name, namespace_aliases)
             fc_id = generate_id(IDPrefix.FUNCTION_CALL)
             fc_item = {
                 "type": "function_call",
@@ -7861,6 +8112,8 @@ async def stream_responses_api(
                 "arguments": "",
                 "status": "in_progress",
             }
+            if namespace:
+                fc_item["namespace"] = namespace
 
             # output_item.added
             seq += 1
@@ -7909,6 +8162,8 @@ async def stream_responses_api(
                 "arguments": arguments,
                 "status": "completed",
             }
+            if namespace:
+                completed_fc["namespace"] = namespace
             seq += 1
             yield format_sse_event(
                 "response.output_item.done",
@@ -7923,6 +8178,23 @@ async def stream_responses_api(
             output_items.append(completed_fc)
             output_index += 1
             next_output_index = output_index
+
+    if tool_failure:
+        seq += 1
+        yield format_sse_event(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "output": output_items,
+                    "error": tool_failure["error"],
+                },
+                "sequence_number": seq,
+            },
+        )
+        return
 
     # Record metrics
     usage_data = None
@@ -8007,7 +8279,7 @@ async def stream_responses_api(
 @app.get("/v1/responses/{response_id}")
 async def get_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Retrieve a stored response."""
     data = _server_state.responses_store.get(response_id)
@@ -8019,7 +8291,7 @@ async def get_response(
 @app.delete("/v1/responses/{response_id}")
 async def delete_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Delete a stored response."""
     if not _server_state.responses_store.delete(response_id):
@@ -8092,8 +8364,8 @@ model and sampling defaults are managed via the admin page.
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="Host to bind to",
+        default=None,
+        help="Host to bind to (default: settings or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -8106,6 +8378,12 @@ model and sampling defaults are managed via the admin page.
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for authentication (required for non-loopback binds)",
     )
 
     args = parser.parse_args()
@@ -8124,6 +8402,15 @@ model and sampling defaults are managed via the admin page.
     from .settings import init_settings
 
     settings = init_settings()
+    if args.host is not None:
+        settings.server.host = args.host
+    if args.api_key is not None:
+        settings.auth.api_key = args.api_key
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        raise SystemExit(1)
     settings.ensure_directories()
 
     # Match the cli.py launcher: keep freed GPU buffers in the pool so
@@ -8146,7 +8433,7 @@ model and sampling defaults are managed via the admin page.
     # Start server
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=settings.server.host, port=args.port)
 
 
 if __name__ == "__main__":

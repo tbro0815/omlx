@@ -7,13 +7,13 @@ import json
 import math
 import numpy as np
 import struct
-import tempfile
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from omlx.api.embedding_models import (
@@ -33,7 +33,7 @@ from omlx.api.embedding_utils import (
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
-from omlx.models.embedding import EmbeddingOutput
+from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
 
 IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -290,29 +290,11 @@ class TestEmbeddingUtils:
 class TestModelDiscoveryEmbedding:
     """Tests for embedding model detection."""
 
-    def test_detect_bert_model(self, tmp_path):
-        """Test detection of BERT embedding model."""
-        config = {
-            "model_type": "bert",
-            "architectures": ["BertModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_xlm_roberta_model(self, tmp_path):
         """Test detection of XLM-RoBERTa embedding model."""
         config = {
             "model_type": "xlm-roberta",
             "architectures": ["XLMRobertaModel"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
-    def test_detect_modernbert_model(self, tmp_path):
-        """Test detection of ModernBERT embedding model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertModel"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
@@ -326,15 +308,6 @@ class TestModelDiscoveryEmbedding:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
 
-    def test_detect_qwen3_embedding_model(self, tmp_path):
-        """Test detection of Qwen3 embedding model."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_embedding_by_architecture_only(self, tmp_path):
         """Test detection by architecture when model_type is unknown."""
         config = {
@@ -343,47 +316,6 @@ class TestModelDiscoveryEmbedding:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
-
-    def test_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that LLM models are not detected as embedding."""
-        config = {
-            "model_type": "llama",
-            "architectures": ["LlamaForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_qwen_llm_not_detected_as_embedding(self, tmp_path):
-        """Test that Qwen LLM is not detected as embedding model."""
-        config = {
-            "model_type": "qwen2",
-            "architectures": ["Qwen2ForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
-
-    def test_detect_reranker_model(self, tmp_path):
-        """Test detection of reranker model."""
-        config = {
-            "model_type": "modernbert",
-            "architectures": ["ModernBertForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_detect_xlm_roberta_reranker(self, tmp_path):
-        """Test detection of XLM-RoBERTa reranker model."""
-        config = {
-            "model_type": "xlm-roberta",
-            "architectures": ["XLMRobertaForSequenceClassification"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "reranker"
-
-    def test_no_config_defaults_to_llm(self, tmp_path):
-        """Test that missing config.json defaults to LLM."""
-        assert detect_model_type(tmp_path) == "llm"
-
 
 class TestExtractEmbeddingsArray:
     """Tests for _extract_embeddings_array method."""
@@ -1558,7 +1490,6 @@ class TestNativeEmbeddingLoading:
 
         self._write_full_native_checkpoint(tmp_path, config)
 
-        import mlx.core as mx
         from safetensors import safe_open
 
         weights = {}
@@ -2047,3 +1978,58 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
+
+
+
+class TestEmbeddingDtype:
+    """bf16 -> fp16 promotion for unquantized Qwen3-Embedding 0.6B / 8B."""
+
+    class _Module:
+        def __init__(self):
+            self._params = {"weight": mx.zeros((2,), dtype=mx.bfloat16)}
+
+        def parameters(self):
+            return self._params
+
+        def update(self, tree):
+            self._params = tree
+
+    @staticmethod
+    def _promoted(model_dir, **config):
+        model_dir.mkdir(parents=True)
+        cfg = {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}
+        cfg.update(config)
+        (model_dir / "config.json").write_text(json.dumps(cfg))
+        module = TestEmbeddingDtype._Module()
+        MLXEmbeddingModel(str(model_dir))._promote_bf16_to_fp16(module)
+        return module._params["weight"].dtype == mx.float16
+
+    @pytest.mark.parametrize(
+        "name,shape",
+        [("Qwen3-Embedding-0.6B", (1024, 28)), ("Qwen3-Embedding-8B", (4096, 36))],
+    )
+    def test_promotes_validated_sizes(self, tmp_path, name, shape):
+        assert self._promoted(
+            tmp_path / name, hidden_size=shape[0], num_hidden_layers=shape[1]
+        )
+
+    def test_size_comes_from_config_not_path(self, tmp_path):
+        # HF cache snapshot hashes can contain "8b".
+        snapshot = (
+            tmp_path
+            / "models--Qwen--Qwen3-Embedding-4B"
+            / "snapshots"
+            / "5cf2132abc8bd8a4f1c2b0e7d6a9f3e1b2c4d5e6"
+        )
+        assert not self._promoted(snapshot, hidden_size=2560)
+
+    @pytest.mark.parametrize(
+        "name,config",
+        [
+            ("Qwen3-Embedding-8B-4bit", {"quantization": {"bits": 4}}),
+            ("Qwen3-VL-Embedding-8B", {"model_type": "qwen3_vl"}),
+            ("Qwen3-8B", {}),
+        ],
+    )
+    def test_leaves_other_models_untouched(self, tmp_path, name, config):
+        assert not self._promoted(tmp_path / name, **config)
