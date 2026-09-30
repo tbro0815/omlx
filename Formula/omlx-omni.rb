@@ -58,11 +58,13 @@ class OmlxOmni < Formula
     skip_clean "libexec" if MacOS.version >= "27"
   end
 
-  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
-  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  # Must match the mlx-audio commit pinned in pyproject.toml: this step runs
+  # after omlx's own install, so a different commit here replaces the one
+  # omlx resolved (0.7.0 shipped with 5175326 here vs 49596ac in pyproject,
+  # downgrading mlx-audio 0.4.8 to 0.4.3).
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+      revision: "49596ac8b69b9ed377db311a73df838795f38a3d"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -174,9 +176,9 @@ class OmlxOmni < Formula
       end
     end
 
-    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
+    # Install mlx-audio with all extras. Since 49596ac it declares
+    # mlx-lm>=0.31.1, so the old ==0.31.1 pin patch is no longer needed.
     resource("mlx-audio").stage do
-      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system(*pip_install, ".[all]")
     end
 
