@@ -162,8 +162,12 @@ class OmlxOmni < Formula
     # most of this fork's reason to exist. Upstream's own formula omits it, so
     # this must be re-applied whenever Formula/omlx.rb is re-synced.
     #
+    # `audio` carries the TTS stack (spaCy, misaki, phonemizer, ...). Older
+    # mlx-audio pulled it in through its own [all] extra; since 49596ac that
+    # extra no longer does, and oMLX 0.7.0 declares it in [audio] instead.
+    #
     # `grammar` stays opt-in because it drags in torch (~2GB).
-    extras = ["jang"]
+    extras = ["jang", "audio"]
     extras << "grammar" if build.with?("grammar")
     install_spec = "#{buildpath}[#{extras.join(",")}]"
     system(*pip_install, install_spec)
