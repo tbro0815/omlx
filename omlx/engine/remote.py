@@ -131,7 +131,10 @@ class RemoteOpenAIEngine(BaseEngine):
 
     # Preserve image_url content parts in the server's chat path; vision
     # models behind OpenAI-compatible APIs consume them natively, and
-    # text-only requests are unaffected.
+    # text-only requests are unaffected. The chat, Anthropic and Responses
+    # paths read accepts_image_input; the decisions path still reads
+    # supports_multimodal_fallback.
+    accepts_image_input = True
     supports_multimodal_fallback = True
 
     def __init__(

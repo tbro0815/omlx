@@ -390,6 +390,31 @@ class TestAppleFMEngine:
         assert outputs[-1].text == "1, 2, 3."
 
 
+class TestImageInputGate:
+    """The server strips image parts unless the engine accepts them.
+
+    Upstream 0.7.1 renamed the gate from supports_multimodal_fallback to
+    accepts_image_input; engines that set only the old name answer blind.
+    """
+
+    @pytest.mark.parametrize(
+        "module,cls,expected",
+        [
+            ("omlx.engine.apple_fm", "AppleFMEngine", True),
+            ("omlx.engine.remote", "RemoteOpenAIEngine", True),
+            ("omlx.engine.cli_relay", "CLIRelayEngine", False),
+        ],
+    )
+    def test_server_gate(self, module, cls, expected):
+        import importlib
+
+        from omlx.server import _engine_accepts_images
+
+        engine_cls = getattr(importlib.import_module(module), cls)
+        engine = engine_cls.__new__(engine_cls)
+        assert _engine_accepts_images(engine) is expected
+
+
 class TestAppleFMImages:
     def _engine_with_image_sdk(self):
         import types

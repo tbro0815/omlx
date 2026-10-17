@@ -48,7 +48,10 @@ class AppleFMEngine(BaseEngine):
 
     # Tell the server's chat path to preserve image_url content parts
     # (otherwise extract_text_content strips them and the model answers
-    # blind). Same mechanism DFlash uses for its VLM fallback.
+    # blind). The chat, Anthropic and Responses paths read
+    # accepts_image_input; the decisions path still reads
+    # supports_multimodal_fallback.
+    accepts_image_input = True
     supports_multimodal_fallback = True
 
     # Inference runs on this machine's Neural Engine / GPU via the local
