@@ -31,7 +31,7 @@ class OmlxOmni < Formula
   # than once per run, and a constant would warn about redefinition.
   omni_tag = "v0.7.0-omni"
   omni_version = "0.7.0"
-  omni_branch = "omni/v0.7.0"
+  omni_branch = "omni/v0.7.1rc1"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
@@ -61,10 +61,10 @@ class OmlxOmni < Formula
   # Must match the mlx-audio commit pinned in pyproject.toml: this step runs
   # after omlx's own install, so a different commit here replaces the one
   # omlx resolved (0.7.0 shipped with 5175326 here vs 49596ac in pyproject,
-  # downgrading mlx-audio 0.4.8 to 0.4.3).
+  # downgrading mlx-audio 0.4.8 to 0.4.3; upstream's formula still has it).
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "49596ac8b69b9ed377db311a73df838795f38a3d"
+      revision: "94c7716212b2228f178d2f9c7619a591fd1b0b78"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -82,7 +82,11 @@ class OmlxOmni < Formula
     working_dir var
     log_path var/"log/omlx.log"
     error_log_path var/"log/omlx.log"
-    environment_variables PATH: std_service_path_env
+    # launchd KeepAlive respawns the process, so it is a supervisor in the
+    # sense /admin/api/server/restart expects: declare it so the dashboard
+    # restart button works under `brew services` instead of returning 503.
+    environment_variables PATH: std_service_path_env,
+                          OMLX_SUPERVISED: "launchd"
   end
 
   # Keep in sync with CUSTOM_KERNELS in upstream's Formula/omlx.rb.
@@ -142,6 +146,18 @@ class OmlxOmni < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
+      # `metal` ships with Xcode, not the Command Line Tools.
+      unless quiet_system("/usr/bin/xcrun", "-f", "metal")
+        odie <<~EOS
+          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          It ships with full Xcode, and on current Xcode versions is a separate component:
+
+            xcodebuild -downloadComponent MetalToolchain
+
+          Otherwise install omlx-omni without the custom kernels.
+        EOS
+      end
+
       kernel_sources = custom_kernels.map do |kernel|
         buildpath/"omlx/custom_kernels/#{kernel}/csrc"
       end
@@ -183,7 +199,8 @@ class OmlxOmni < Formula
     end
 
     # Install mlx-audio with all extras. Since 49596ac it declares
-    # mlx-lm>=0.31.1, so the old ==0.31.1 pin patch is no longer needed.
+    # mlx-lm>=0.31.1 (still true at 94c7716), so the old ==0.31.1 pin patch
+    # is no longer needed.
     resource("mlx-audio").stage do
       system(*pip_install, ".[all]")
     end
@@ -342,6 +359,9 @@ class OmlxOmni < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import pathlib, omlx_web; " \
+           "assert (pathlib.Path(omlx_web.__file__).parent / 'templates/dashboard.html').is_file()"
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
     if build.with?("custom-kernel")
