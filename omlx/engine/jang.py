@@ -138,6 +138,42 @@ def _materialize_module_arrays(model) -> None:
         mx.eval(arrays)
 
 
+def _drop_compiled_module_functions(model) -> int:
+    """Drop mx.compile'd functions cached on the model's modules.
+
+    jang_tools' DeepSeek-V4 decode path compiles closures over ``self`` on
+    first use and caches them in the module's __dict__ (for example
+    ``_decode_front_compiled``), so each trace holds that module's weights as
+    constants. The trace lives with the thread that ran it, the per-engine
+    thread. EngineCore.close() shuts that thread down while the model is
+    still referenced, and destroying the compiled functions later on another
+    thread never releases the traces: every unload after a generation leaked
+    the whole model (~71 GB for DeepSeek-V4-Flash-JANGTQ2). Must run on the
+    engine thread before close(). Returns the number of functions dropped.
+    """
+    import gc
+
+    compiled_type = type(mx.compile(lambda x: x))
+    modules = [model]
+    if hasattr(model, "named_modules"):
+        try:
+            modules = [m for _, m in model.named_modules()]
+        except Exception:
+            modules = [model]
+    dropped = 0
+    for module in modules:
+        try:
+            items = list(vars(module).items())
+        except TypeError:
+            continue
+        for key, value in items:
+            if isinstance(value, compiled_type):
+                del module.__dict__[key]
+                dropped += 1
+    gc.collect()
+    return dropped
+
+
 def _install_deepseek_v4_tokenizer_patches(model_path: Path) -> None:
     """Give DeepSeek-V4 JANG checkpoints the DSML chat template and tool parser.
 
@@ -862,6 +898,15 @@ class JANGLoader(BaseEngine):
                 get_mlx_executor(),
                 _materialize_jang_tools_globals,
             )
+            # The JANGTQ warmup is a 1-token forward, so it builds the
+            # DeepSeek-V4 decode closures on this loader thread. Drop them
+            # here, on the thread that built them; the engine thread rebuilds
+            # its own on first decode and drops those in stop().
+            await _loop.run_in_executor(
+                get_mlx_executor(),
+                _drop_compiled_module_functions,
+                self._model,
+            )
 
             # Create engine config (copy to avoid mutating the shared instance)
             scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
@@ -932,7 +977,26 @@ class JANGLoader(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            core = self._engine.engine
+            executor = getattr(core, "_mlx_executor", None)
+            if self._model is not None and executor is not None:
+                import asyncio
+
+                try:
+                    dropped = await asyncio.get_running_loop().run_in_executor(
+                        executor, _drop_compiled_module_functions, self._model
+                    )
+                    if dropped:
+                        logger.info(
+                            "Dropped %d compiled module function(s) on the "
+                            "engine thread before close",
+                            dropped,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Dropping compiled module functions failed", exc_info=True
+                    )
+            core.close()
         self._engine = None
         self._model = None
         self._tokenizer = None
