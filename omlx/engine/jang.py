@@ -8,6 +8,7 @@ with mixed-precision quantization (attention 6-8-bit, experts 2-4-bit).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -136,6 +137,60 @@ def _materialize_module_arrays(model) -> None:
                 _collect(v)
     if arrays:
         mx.eval(arrays)
+
+
+# mlx_lm.models.* entries jang_tools installed on an earlier load. Its
+# register() runs once, on first import of the architecture package.
+_JANG_MODEL_MODULES: dict[str, Any] = {}
+
+
+@contextlib.contextmanager
+def _scoped_jang_model_modules():
+    """Install jang_tools' mlx_lm.models.* overrides only while loading.
+
+    jang_tools registers its own implementations as mlx-lm model modules,
+    e.g. ``sys.modules["mlx_lm.models.deepseek_v4"] =
+    jang_tools.dsv4.mlx_model``, and never removes them. Upstream's
+    DeepSeek-V4 patch installs its module only when that entry is missing, so
+    after one JANG DeepSeek-V4 load every non-JANG DeepSeek-V4 checkpoint
+    failed with "module 'jang_tools.dsv4.mlx_model' has no attribute
+    'DeepseekV4Block'". Re-install jang_tools' modules from earlier loads
+    for this load, then restore what was there before. A loaded model keeps
+    its classes, so it does not need the entries afterwards.
+    """
+    import sys
+
+    prefix = "mlx_lm.models."
+
+    def _is_jang(module: Any) -> bool:
+        return str(getattr(module, "__name__", "")).startswith("jang_tools")
+
+    before = {k: v for k, v in sys.modules.items() if k.startswith(prefix)}
+    sys.modules.update(_JANG_MODEL_MODULES)
+    try:
+        yield
+    finally:
+        for key, module in list(sys.modules.items()):
+            if not key.startswith(prefix) or not _is_jang(module):
+                continue
+            _JANG_MODEL_MODULES[key] = module
+            previous = before.get(key)
+            if previous is not None and not _is_jang(previous):
+                sys.modules[key] = previous
+            else:
+                del sys.modules[key]
+
+
+def _serializes_requests(model) -> bool:
+    """Whether the model must decode one request at a time.
+
+    jang_tools' DeepSeek-V4 model assumes an integer cache offset; a batched
+    decode passes per-row array offsets and fails in mx.arange.
+    """
+    inner = getattr(model, "_model", model)
+    return any(
+        type(m).__module__.startswith("jang_tools.dsv4") for m in (model, inner)
+    )
 
 
 def _drop_compiled_module_functions(model) -> int:
@@ -796,48 +851,49 @@ class JANGLoader(BaseEngine):
             # (Metal kernel, no dequant) and load_jangtq_model auto-caps the MLX
             # wired_limit to prevent Metal OOM — must be checked before the
             # standard VLM/LLM paths.
-            if is_jangtq:
-                from jang_tools.load_jangtq import load_jangtq_model
-                logger.info(f"Loading JANGTQ model: {self._model_name}")
-                self._model, self._tokenizer = await _loop.run_in_executor(
-                    get_mlx_executor(), load_jangtq_model, self._model_name
-                )
-                self._processor = None
-            elif is_vlm:
-                logger.info(f"Loading JANG VLM model: {self._model_name}")
-                self._model, self._processor = await _loop.run_in_executor(
-                    get_mlx_executor(), load_jang_vlm_model, self._model_name
-                )
-                # Extract tokenizer from processor for token counting
-                if hasattr(self._processor, "tokenizer"):
-                    self._tokenizer = self._processor.tokenizer
-                else:
-                    self._tokenizer = self._processor
-                # Wrap model with VLMModelAdapter for BatchGenerator compatibility
-                logger.info("Wrapping VLM model with VLMModelAdapter")
-                self._model = VLMModelAdapter(self._model)
-            else:
-                logger.info(f"Loading JANG model: {self._model_name}")
-                self._model, self._tokenizer = await _loop.run_in_executor(
-                    get_mlx_executor(), load_jang_model, self._model_name
-                )
-                self._processor = None
-                # jang_tools may internally dispatch to its VLM loader: JANG
-                # v2 checkpoints with a vision_config (e.g. Mistral-Small-4)
-                # load as mlx-vlm models even when jang_config metadata says
-                # has_vision=false, so this text-only branch was chosen. Such
-                # models use the mlx-vlm calling convention (positional
-                # pixel_values/mask), which the text-only BatchGenerator
-                # cannot drive — every generation dies with
-                # "Model.__call__() missing 2 required positional arguments".
-                # Wrap with VLMModelAdapter (same as the VLM branch), which
-                # forwards text-only calls to the underlying language_model.
-                if hasattr(self._model, "language_model"):
-                    logger.info(
-                        "JANG loader returned a VLM-style model; wrapping "
-                        "with VLMModelAdapter for text-only serving"
+            with _scoped_jang_model_modules():
+                if is_jangtq:
+                    from jang_tools.load_jangtq import load_jangtq_model
+                    logger.info(f"Loading JANGTQ model: {self._model_name}")
+                    self._model, self._tokenizer = await _loop.run_in_executor(
+                        get_mlx_executor(), load_jangtq_model, self._model_name
                     )
+                    self._processor = None
+                elif is_vlm:
+                    logger.info(f"Loading JANG VLM model: {self._model_name}")
+                    self._model, self._processor = await _loop.run_in_executor(
+                        get_mlx_executor(), load_jang_vlm_model, self._model_name
+                    )
+                    # Extract tokenizer from processor for token counting
+                    if hasattr(self._processor, "tokenizer"):
+                        self._tokenizer = self._processor.tokenizer
+                    else:
+                        self._tokenizer = self._processor
+                    # Wrap model with VLMModelAdapter for BatchGenerator compatibility
+                    logger.info("Wrapping VLM model with VLMModelAdapter")
                     self._model = VLMModelAdapter(self._model)
+                else:
+                    logger.info(f"Loading JANG model: {self._model_name}")
+                    self._model, self._tokenizer = await _loop.run_in_executor(
+                        get_mlx_executor(), load_jang_model, self._model_name
+                    )
+                    self._processor = None
+                    # jang_tools may internally dispatch to its VLM loader: JANG
+                    # v2 checkpoints with a vision_config (e.g. Mistral-Small-4)
+                    # load as mlx-vlm models even when jang_config metadata says
+                    # has_vision=false, so this text-only branch was chosen. Such
+                    # models use the mlx-vlm calling convention (positional
+                    # pixel_values/mask), which the text-only BatchGenerator
+                    # cannot drive — every generation dies with
+                    # "Model.__call__() missing 2 required positional arguments".
+                    # Wrap with VLMModelAdapter (same as the VLM branch), which
+                    # forwards text-only calls to the underlying language_model.
+                    if hasattr(self._model, "language_model"):
+                        logger.info(
+                            "JANG loader returned a VLM-style model; wrapping "
+                            "with VLMModelAdapter for text-only serving"
+                        )
+                        self._model = VLMModelAdapter(self._model)
 
             # Wrap tokenizer if needed (some VLM processors don't have encode method)
             if self._tokenizer is not None and not hasattr(self._tokenizer, "encode"):
@@ -925,6 +981,13 @@ class JANGLoader(BaseEngine):
             )
 
             await self._engine.engine.start()
+            if _serializes_requests(self._model):
+                # Same admission cap upstream applies to Llama 4.
+                self._engine.engine.scheduler._serialize_llama4_requests = True
+                logger.info(
+                    "jang_tools DeepSeek-V4 cannot batch decode rows; "
+                    "serializing requests"
+                )
             self._loaded = True
             logger.info(f"JANGLoader loaded: {self._model_name}")
 
