@@ -29,15 +29,15 @@ class OmlxOmni < Formula
   #
   # A class-body local, not a constant: Homebrew may load a formula file more
   # than once per run, and a constant would warn about redefinition.
-  omni_tag = "v0.7.1rc1.3-omni"
-  omni_version = "0.7.1rc1.3"
+  omni_tag = "v0.7.1rc1.4-omni"
+  omni_version = "0.7.1rc1.4"
   omni_branch = "omni/v0.7.1rc1"
 
   desc "oMLX with Jang and external-model support"
   homepage "https://github.com/tbro0815/omlx"
   url "https://github.com/tbro0815/omlx/archive/refs/tags/#{omni_tag}.tar.gz"
   version omni_version
-  sha256 "c9320ef5058b5e493a093edc806acc58051b0b384d123ab903a37d7dd499dd38"
+  sha256 "0eb0681b24d97183bff4a677ffb80a2f99abad9757fb20f7bb7a61049f306b27"
   license "Apache-2.0"
 
   head "https://github.com/tbro0815/omlx.git", branch: omni_branch
