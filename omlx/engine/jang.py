@@ -138,6 +138,36 @@ def _materialize_module_arrays(model) -> None:
         mx.eval(arrays)
 
 
+def _install_deepseek_v4_tokenizer_patches(model_path: Path) -> None:
+    """Give DeepSeek-V4 JANG checkpoints the DSML chat template and tool parser.
+
+    Their tokenizer_config.json ships no chat template; the encoder lives in
+    a Python file (encoding/encoding_dsv4.py) that mlx-lm never loads, so
+    every chat request failed with "tokenizer.chat_template is not set".
+    The batched engine gets the template from the deepseek_v4 patch, which
+    wraps mlx-lm's tokenizer load. jang_tools loads the tokenizer through
+    that same mlx_lm.utils.load_tokenizer, so installing only the tokenizer
+    half of the patch is enough; the model half targets mlx-lm's DeepSeek-V4
+    implementation, which jang_tools does not use. V4.1 has its own patch.
+    """
+    try:
+        with open(model_path / "config.json") as f:
+            model_type = str(json.load(f).get("model_type", ""))
+    except (OSError, ValueError, AttributeError):
+        return
+    if not model_type.startswith("deepseek_v4") or model_type.startswith(
+        "deepseek_v41"
+    ):
+        return
+    from ..patches.deepseek_v4.tokenizer_patch import (
+        apply_load_patch,
+        apply_tokenizer_patch,
+    )
+
+    apply_tokenizer_patch()
+    apply_load_patch()
+
+
 def _materialize_jang_tools_globals() -> None:
     """Force-evaluate mx.arrays held in jang_tools module globals.
 
@@ -678,6 +708,7 @@ class JANGLoader(BaseEngine):
 
         is_vlm = self._should_use_vlm_loader()
         is_jangtq = self._is_jangtq()
+        _install_deepseek_v4_tokenizer_patches(model_path)
 
         # F1: JANGTQ + VLM is an unsupported combination.  load_jangtq_model is
         # text-only and would silently drop the vision encoder.  Fail loudly here
