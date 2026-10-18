@@ -138,6 +138,61 @@ def _materialize_module_arrays(model) -> None:
         mx.eval(arrays)
 
 
+def _materialize_jang_tools_globals() -> None:
+    """Force-evaluate mx.arrays held in jang_tools module globals.
+
+    Some jang_tools model code memoizes arrays at module level, e.g.
+    ``jang_tools.dsv4.mlx_model._Q_NORM_WEIGHT_CACHE`` holds lazy
+    ``mx.ones`` weights for the per-head Q norm. The JANGTQ loader's warmup
+    forward fills such caches on the loader thread without evaluating them,
+    so they stay bound to that thread's stream, and the first prefill on the
+    per-engine thread fails with "There is no Stream(gpu, N) in current
+    thread". _materialize_module_arrays only sees arrays reachable from the
+    model, so scan the jang_tools modules too. Must run on the loader thread.
+    """
+    import sys
+
+    arrays: list[mx.array] = []
+    seen: set[int] = set()
+
+    def _collect(value: Any, depth: int = 0) -> None:
+        if isinstance(value, mx.array):
+            if id(value) not in seen:
+                seen.add(id(value))
+                arrays.append(value)
+        elif depth < 2 and isinstance(value, (list, tuple)):
+            for v in value:
+                _collect(v, depth + 1)
+        elif depth < 2 and isinstance(value, dict):
+            for v in value.values():
+                _collect(v, depth + 1)
+
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "jang_tools" or name.startswith("jang_tools.")):
+            continue
+        try:
+            values = list(vars(module).values())
+        except TypeError:
+            continue
+        for value in values:
+            _collect(value)
+    if not arrays:
+        return
+    try:
+        mx.eval(arrays)
+    except Exception:
+        # A global can hold an array that cannot be evaluated, e.g. a
+        # placeholder left behind by mx.compile tracing. Evaluate one at a
+        # time and leave those alone.
+        skipped = 0
+        for array in arrays:
+            try:
+                mx.eval(array)
+            except Exception:
+                skipped += 1
+        logger.debug("jang_tools globals: skipped %d unevaluable arrays", skipped)
+
+
 class JANGLoader(BaseEngine):
     """
     Engine for loading JANG quantized models via jang-tools.
@@ -771,6 +826,10 @@ class JANGLoader(BaseEngine):
                 get_mlx_executor(),
                 _materialize_module_arrays,
                 self._model,
+            )
+            await _loop.run_in_executor(
+                get_mlx_executor(),
+                _materialize_jang_tools_globals,
             )
 
             # Create engine config (copy to avoid mutating the shared instance)
