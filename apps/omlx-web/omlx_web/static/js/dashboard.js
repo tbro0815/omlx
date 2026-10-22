@@ -616,6 +616,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
@@ -7426,6 +7427,7 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
+                        preserve_ngram_table: this.oqPreservesNgram(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -7573,6 +7575,10 @@
                 return model?.model_type || '';
             },
 
+            oqPreservesNgram() {
+                return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
+            },
+
             oqAvailableLevels() {
                 return this.oqSelectedModelType() === 'deepseek_v41'
                     ? [2, 2.5, 2.7, 3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
@@ -7644,6 +7650,7 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                             preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
+                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {

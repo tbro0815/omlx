@@ -84,6 +84,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
 | Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
 | Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
+| Keep original Engram tables | DeepSeek V4.1 only. Copies the Engram tables in their original FP8 storage instead of 4-bit. The output is larger on disk, and memory use with SSD N-gram Offload stays the same. Adds `-ngram` to the name |
 | Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
 | Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
 | Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
@@ -98,6 +99,16 @@ Writing the quantized model needs little memory because tensors are read and wri
 - If the model does not fit in about 75% of the available memory, oQ makes a temporary 4-bit copy on disk, calibrates on that copy and deletes it afterwards. This needs extra free disk space while it runs.
 - MiniMax M3 and Qwen4-Exp models calibrate one layer at a time instead.
 
+### Flint
+
+Flint calibration uses the native full/sliding attention mask for each layer and captures output-head inputs after final RMSNorm and the FP32 cast. Enhanced calibration can stream original BF16 layers without a quantized proxy; it is selected automatically when the full model exceeds the calibration memory budget.
+
+For an explicitly proxy-free oQ4e or oQ6e conversion through `quantize_oq_streaming()`, use the original checkpoint with `enhanced=True`, `stream_calibration=True`, `auto_proxy_sensitivity=False` and `imatrix_strict=True`. Compatible BF16 imatrix statistics can be reused between output levels, but sensitivity is measured again for the requested level. The cache includes a Flint-specific layer-walk version.
+
+Layer streaming still needs memory for a decoder layer, temporary weights, activations and expert statistics; it is not a hard memory cap. Strict imatrix coverage checks tensor entries, not sufficient expert sampling. Inspect `collection.collection_sufficient` and `collection.coverage_sufficient` in `oq_imatrix_report.json`; coverage alone does not establish model quality.
+
+Calibration equivalence does not establish inference chunking equivalence. Quantized Flint can produce different raw logits for single-pass and chunked cached prefill. The cause remains unresolved, and oQ6e did not consistently reduce the discrepancy. Matching next tokens does not establish unchanged probabilities or rule out a cache bug.
+
 ## Supported models
 
 oQ works with models that mlx-lm or mlx-vlm can load, including MoE and vision-language models. The source must be the original checkpoint:
@@ -110,7 +121,7 @@ Models that are already MLX-quantized cannot be used as a source.
 
 Some models have their own rules:
 
-- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit.
+- **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit unless Keep original Engram tables is on.
 - **DeepSeek V4:** float16 output is not supported.
 
 ## Benchmarks
